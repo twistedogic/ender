@@ -1,0 +1,11 @@
+cash: 20000
+events:
+  - when: 0
+    type: job
+    salary: { monthly: 8000, annualized_rate: 0.03 }
+  - when: 0
+    type: expense
+    rent: { monthly: 2000, annualized_rate: 0.02 }
+  - when: 6
+    type: investment
+    fund: { principal: 5000, annualized_rate: 0.05, investment: { investment: { monthly: 500 } } }
