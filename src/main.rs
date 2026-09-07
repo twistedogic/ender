@@ -55,6 +55,11 @@ enum CashflowItem {
         monthly: f64,
         annualized_rate: f64,
     },
+    OneOff {
+        amount: f64,
+        #[serde(default)]
+        fired: bool,
+    },
     Empty,
 }
 
@@ -112,6 +117,13 @@ impl CashflowItem {
                 let m = monthly.clone();
                 *monthly *= (1.0 + *annualized_rate).powf(1.0 / 12.0);
                 Cashflow::Expense(m)
+            }
+            Self::OneOff { amount, fired } => {
+                if *fired {
+                    return Cashflow::Income(0.0);
+                }
+                *fired = true;
+                Cashflow::new(*amount)
             }
         }
     }
@@ -215,6 +227,8 @@ enum EventType {
     BuyHome(Asset),
     BuyToLet(Asset),
     Investment(Asset),
+    OneOffExpense(Labeled),
+    OneOffIncome(Labeled),
     End { id: String },
 }
 
@@ -232,6 +246,19 @@ impl EventType {
                 s.assets.push(a);
             }
             Self::Tuition(i) => s.cashflow.push(i),
+            Self::OneOffExpense(mut i) => {
+                if let CashflowItem::OneOff { amount, .. } = &mut i.item {
+                    *amount = -amount.abs();
+                }
+                s.cashflow.push(i);
+            }
+            Self::OneOffIncome(mut i) => {
+                if let CashflowItem::OneOff { amount, .. } = &mut i.item {
+                    *amount = amount.abs();
+                }
+                s.cashflow.push(i);
+            }
+
             Self::Graduate { id } => s.remove_cashflow(
                 id.as_deref(),
                 |item| matches!(item, CashflowItem::Tuition { .. }),
@@ -629,6 +656,65 @@ events:
         assert_eq!(stats[3].monthly_cashflow, 0.0);
     }
 
+    #[test]
+    fn one_off_expense_lands_once() {
+        let yaml = "cash: 20000\nevents:\n  - { when: 3, type: one_off_expense, one_off: { amount: 5000 } }\n";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(5);
+        assert_eq!(stats[2].monthly_cashflow, 0.0);
+        assert_eq!(stats[3].monthly_cashflow, -5000.0);
+        assert_eq!(stats[3].cash, 15000.0);
+        assert_eq!(stats[4].monthly_cashflow, 0.0);
+        assert_eq!(stats[5].cash, 15000.0);
+    }
+
+    #[test]
+    fn one_off_fired_defaults_to_false() {
+        let yaml = "cash: 0\nevents:\n  - { when: 0, type: one_off_expense, one_off: { amount: 100 } }\n";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(1);
+        assert_eq!(stats[0].monthly_cashflow, -100.0);
+        assert_eq!(stats[1].monthly_cashflow, 0.0);
+    }
+
+    #[test]
+    fn one_off_income_lands_once() {
+        let yaml = "cash: 0\nevents:\n  - { when: 6, type: one_off_income, one_off: { amount: 10000 } }\n";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(8);
+        assert_eq!(stats[5].monthly_cashflow, 0.0);
+        assert_eq!(stats[6].monthly_cashflow, 10000.0);
+        assert_eq!(stats[6].cash, 10000.0);
+        assert_eq!(stats[7].monthly_cashflow, 0.0);
+    }
+
+    #[test]
+    fn one_off_sign_comes_from_event_type() {
+        let yaml = "cash: 0\nevents:\n  - { when: 0, type: one_off_expense, one_off: { amount: -5000 } }\n  - { when: 0, type: one_off_income, one_off: { amount: -1000 } }\n";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(0);
+        assert_eq!(stats[0].monthly_cashflow, -4000.0);
+    }
+
+    #[test]
+    fn end_removes_a_one_off_before_it_fires() {
+        let yaml = "cash: 20000\nevents:\n  - { when: 0, type: one_off_expense, id: tax, one_off: { amount: 5000 } }\n  - { when: 0, type: end, id: tax }\n";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(1);
+        assert_eq!(stats[0].monthly_cashflow, 0.0);
+        assert_eq!(stats[1].cash, 20000.0);
+    }
+
     fn write_tmp(name: &str, content: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(name);
         std::fs::write(&path, content).unwrap();
@@ -673,6 +759,8 @@ events:
     type: buy_to_let
     property: { sqft: 900, price_per_sqft: 200, capex_per_sqft: 15, annualized_rate: 0.02, mortgage: { mortgage: { monthly: 1200, period: 120 } }, rental: { rental_income: { occupancy: 0.85, monthly: 2200, annualized_rate: 0.02 } } }
   - { when: 24, type: end, id: 401k }
+  - { when: 2, type: one_off_expense, one_off: { amount: 5000 } }
+  - { when: 3, type: one_off_income, one_off: { amount: 5000 } }
 "#;
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
@@ -680,8 +768,9 @@ events:
         let stats = s.run(24);
         assert_eq!(stats.len(), 25);
         // salary fired then was removed by layoff; rent remains
-        assert_eq!(s.cashflow.len(), 1);
+        assert_eq!(s.cashflow.len(), 3);
         assert!(matches!(&s.cashflow[0].item, CashflowItem::Rent { monthly, .. } if *monthly > 2000.0));
+        assert!(s.cashflow[1..].iter().all(|l| matches!(l.item, CashflowItem::OneOff { fired: true, .. })));
         // fund + home + rental property
         assert_eq!(s.assets.len(), 3);
         // the 401k contribution was ended at month 24
