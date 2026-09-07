@@ -205,9 +205,13 @@ impl Asset {
 enum EventType {
     Job(Labeled),
     Expense(Labeled),
-    Inition(Labeled),
-    Graduate,
-    Layoff,
+    Tuition(Labeled),
+    Graduate {
+        id: Option<String>,
+    },
+    Layoff {
+        id: Option<String>,
+    },
     BuyHome(Asset),
     BuyToLet(Asset),
     Investment(Asset),
@@ -218,29 +222,20 @@ impl EventType {
     fn apply(self, s: &mut Scenario) {
         match self {
             Self::Job(i) => s.cashflow.push(i),
-            Self::Layoff => {
-                if let Some(idx) = s
-                    .cashflow
-                    .iter()
-                    .position(|l| matches!(l.item, CashflowItem::Salary { .. }))
-                {
-                    s.cashflow.remove(idx);
-                }
-            }
+            Self::Layoff { id } => s.remove_cashflow(
+                id.as_deref(),
+                |item| matches!(item, CashflowItem::Salary { .. }),
+            ),
             Self::Expense(e) => s.cashflow.push(e),
-            Self::BuyHome(a) => s.assets.push(a),
-            Self::BuyToLet(a) => s.assets.push(a),
-            Self::Investment(a) => s.assets.push(a),
-            Self::Inition(i) => s.cashflow.push(i),
-            Self::Graduate => {
-                if let Some(idx) = s
-                    .cashflow
-                    .iter()
-                    .position(|l| matches!(l.item, CashflowItem::Tuition { .. }))
-                {
-                    s.cashflow.remove(idx);
-                }
+            Self::BuyHome(a) | Self::BuyToLet(a) | Self::Investment(a) => {
+                s.cash -= a.value();
+                s.assets.push(a);
             }
+            Self::Tuition(i) => s.cashflow.push(i),
+            Self::Graduate { id } => s.remove_cashflow(
+                id.as_deref(),
+                |item| matches!(item, CashflowItem::Tuition { .. }),
+            ),
             Self::End { id } => {
                 if let Some(idx) = s
                     .cashflow
@@ -300,6 +295,18 @@ struct Scenario {
 }
 
 impl Scenario {
+    /// With `id`: remove the first cashflow carrying it (silent no-op if none).
+    /// Without: remove the first item matching `of_kind` (legacy behavior).
+    fn remove_cashflow(&mut self, id: Option<&str>, of_kind: impl Fn(&CashflowItem) -> bool) {
+        let idx = match id {
+            Some(id) => self.cashflow.iter().position(|l| l.id.as_deref() == Some(id)),
+            None => self.cashflow.iter().position(|l| of_kind(&l.item)),
+        };
+        if let Some(idx) = idx {
+            self.cashflow.remove(idx);
+        }
+    }
+
     fn once(&mut self) -> Stats {
         let mut i = 0;
         while i < self.events.len() {
@@ -385,6 +392,157 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buy_home_deducts_full_price_from_cash() {
+        let yaml = "
+cash: 50000
+events:
+  - when: 0
+    type: buy_home
+    property: { sqft: 1000, price_per_sqft: 30, capex_per_sqft: 0, annualized_rate: 0.0, mortgage: { mortgage: { monthly: 0, period: 12 } } }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(0);
+        assert_eq!(stats[0].cash, 20000.0); // 50000 - 1000*30
+        assert_eq!(stats[0].monthly_cashflow, 0.0); // one-time cost, not a flow
+        assert_eq!(stats[0].assets_value, 30000.0);
+    }
+
+    #[test]
+    fn investment_deducts_principal_from_cash() {
+        let yaml = "
+cash: 20000
+events:
+  - when: 0
+    type: investment
+    fund: { principal: 5000, annualized_rate: 0.0 }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(0);
+        assert_eq!(stats[0].cash, 15000.0);
+        assert_eq!(stats[0].assets_value, 5000.0); // principal starts intact
+    }
+
+    #[test]
+    fn purchase_price_deducted_exactly_once() {
+        let yaml = "
+cash: 50000
+events:
+  - when: 0
+    type: buy_home
+    property: { sqft: 1000, price_per_sqft: 30, capex_per_sqft: 0, annualized_rate: 0.0, mortgage: { mortgage: { monthly: 100, period: 240 } } }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(2);
+        assert_eq!(stats[0].cash, 19900.0); // 50000 - 30000 price - 100 mortgage
+        assert_eq!(stats[1].cash - stats[0].cash, -100.0);
+        assert_eq!(stats[2].cash - stats[1].cash, -100.0);
+    }
+
+    #[test]
+    fn layoff_with_id_removes_that_salary() {
+        let yaml = "
+cash: 0
+events:
+  - { when: 0, type: job, id: me, salary: { monthly: 8000, annualized_rate: 0.0 } }
+  - { when: 0, type: job, id: partner, salary: { monthly: 6000, annualized_rate: 0.0 } }
+  - { when: 2, type: layoff, id: partner }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(3);
+        assert_eq!(stats[1].monthly_cashflow, 14000.0);
+        assert_eq!(stats[2].monthly_cashflow, 8000.0);
+        assert_eq!(stats[3].monthly_cashflow, 8000.0);
+    }
+
+    #[test]
+    fn layoff_without_id_removes_first_salary() {
+        let yaml = "
+cash: 0
+events:
+  - { when: 0, type: job, id: me, salary: { monthly: 8000, annualized_rate: 0.0 } }
+  - { when: 0, type: job, id: partner, salary: { monthly: 6000, annualized_rate: 0.0 } }
+  - { when: 1, type: layoff }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(2);
+        assert_eq!(stats[1].monthly_cashflow, 6000.0);
+        assert_eq!(stats[2].monthly_cashflow, 6000.0);
+    }
+
+    #[test]
+    fn graduate_with_id_removes_that_tuition() {
+        let yaml = "
+cash: 0
+events:
+  - { when: 0, type: expense, id: kid-1, tuition: { monthly: 400, annualized_rate: 0.0 } }
+  - { when: 0, type: expense, id: kid-2, tuition: { monthly: 600, annualized_rate: 0.0 } }
+  - { when: 1, type: graduate, id: kid-2 }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(2);
+        assert_eq!(stats[0].monthly_cashflow, -1000.0);
+        assert_eq!(stats[1].monthly_cashflow, -400.0);
+        assert_eq!(stats[2].monthly_cashflow, -400.0);
+    }
+
+    #[test]
+    fn layoff_with_unknown_id_is_noop() {
+        let yaml = "
+cash: 100
+events:
+  - { when: 0, type: job, salary: { monthly: 8000, annualized_rate: 0.0 } }
+  - { when: 1, type: layoff, id: ghost }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(2);
+        assert_eq!(stats[1].cash, 16100.0); // no-op: both months paid
+        assert_eq!(stats[2].monthly_cashflow, 8000.0);
+    }
+
+    #[test]
+    fn tuition_event_loads_and_adds_tuition() {
+        let yaml = "
+cash: 0
+events:
+  - when: 0
+    type: tuition
+    tuition: { monthly: 800, annualized_rate: 0.0 }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        s.once();
+        assert_eq!(s.cashflow.len(), 1);
+        assert!(matches!(s.cashflow[0].item, CashflowItem::Tuition { .. }));
+    }
+
+    #[test]
+    fn inition_is_rejected() {
+        let path = write_tmp(
+            "ender_inition.yaml",
+            "cash: 0\nevents:\n  - { when: 0, type: inition, tuition: { monthly: 800, annualized_rate: 0.0 } }\n",
+        );
+        let Err(err) = load(&path) else {
+            panic!("expected load to fail")
+        };
+        assert!(err.contains("inition"), "error: {err}");
+    }
 
     #[test]
     fn expense_event_fires_exactly_once() {
@@ -501,6 +659,10 @@ events:
     rent: { monthly: 2000, annualized_rate: 0.02 }
   - when: 6
     type: layoff
+  - when: 0
+    type: tuition
+    tuition: { monthly: 800, annualized_rate: 0.02 }
+  - { when: 8, type: graduate }
   - when: 9
     type: investment
     fund: { principal: 1000, annualized_rate: 0.05, investment: { id: 401k, investment: { monthly: 500 } } }
