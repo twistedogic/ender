@@ -118,20 +118,34 @@ impl CashflowItem {
 }
 
 #[derive(Deserialize)]
+struct Labeled {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(flatten)]
+    item: CashflowItem,
+}
+
+impl Labeled {
+    fn monthly(&mut self) -> Cashflow {
+        self.item.monthly()
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Asset {
     Fund {
         principal: f64,
         annualized_rate: f64,
-        investment: Option<CashflowItem>,
+        investment: Option<Labeled>,
     },
     Property {
         sqft: f64,
         price_per_sqft: f64,
         capex_per_sqft: f64,
         annualized_rate: f64,
-        mortgage: CashflowItem,
-        rental: Option<CashflowItem>,
+        mortgage: Labeled,
+        rental: Option<Labeled>,
     },
 }
 
@@ -189,14 +203,15 @@ impl Asset {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum EventType {
-    Job(CashflowItem),
-    Expense(CashflowItem),
-    Inition(CashflowItem),
+    Job(Labeled),
+    Expense(Labeled),
+    Inition(Labeled),
     Graduate,
     Layoff,
     BuyHome(Asset),
     BuyToLet(Asset),
     Investment(Asset),
+    End { id: String },
 }
 
 impl EventType {
@@ -204,10 +219,11 @@ impl EventType {
         match self {
             Self::Job(i) => s.cashflow.push(i),
             Self::Layoff => {
-                if let Some(idx) = s.cashflow.iter().position(|x| match x {
-                    CashflowItem::Salary { .. } => true,
-                    _ => false,
-                }) {
+                if let Some(idx) = s
+                    .cashflow
+                    .iter()
+                    .position(|l| matches!(l.item, CashflowItem::Salary { .. }))
+                {
                     s.cashflow.remove(idx);
                 }
             }
@@ -217,11 +233,45 @@ impl EventType {
             Self::Investment(a) => s.assets.push(a),
             Self::Inition(i) => s.cashflow.push(i),
             Self::Graduate => {
-                if let Some(idx) = s.cashflow.iter().position(|x| match x {
-                    CashflowItem::Tuition { .. } => true,
-                    _ => false,
-                }) {
+                if let Some(idx) = s
+                    .cashflow
+                    .iter()
+                    .position(|l| matches!(l.item, CashflowItem::Tuition { .. }))
+                {
                     s.cashflow.remove(idx);
+                }
+            }
+            Self::End { id } => {
+                if let Some(idx) = s
+                    .cashflow
+                    .iter()
+                    .position(|l| l.id.as_deref() == Some(&id))
+                {
+                    s.cashflow.remove(idx);
+                    return;
+                }
+                for asset in &mut s.assets {
+                    match asset {
+                        Asset::Property { rental, mortgage, .. } => {
+                            if rental.as_ref().is_some_and(|r| r.id.as_deref() == Some(&id)) {
+                                *rental = None;
+                                return;
+                            }
+                            if mortgage.id.as_deref() == Some(&id) {
+                                // ended mortgage keeps its slot but stops costing anything
+                                mortgage.item = CashflowItem::Empty;
+                                return;
+                            }
+                        }
+                        Asset::Fund { investment, .. } => {
+                            if investment
+                                .as_ref()
+                                .is_some_and(|i| i.id.as_deref() == Some(&id))
+                            {
+                                *investment = None;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -244,7 +294,7 @@ struct Stats {
 struct Scenario {
     at: u16,
     cash: f64,
-    cashflow: Vec<CashflowItem>,
+    cashflow: Vec<Labeled>,
     assets: Vec<Asset>,
     events: Vec<Event>,
 }
@@ -345,9 +395,12 @@ mod tests {
             assets: Vec::new(),
             events: vec![Event {
                 when: 3,
-                kind: EventType::Expense(CashflowItem::Rent {
-                    monthly: 2000.0,
-                    annualized_rate: 0.0,
+                kind: EventType::Expense(Labeled {
+                    id: None,
+                    item: CashflowItem::Rent {
+                        monthly: 2000.0,
+                        annualized_rate: 0.0,
+                    },
                 }),
             }],
         };
@@ -356,6 +409,66 @@ mod tests {
         assert_eq!(stats[2].monthly_cashflow, 0.0);
         assert_eq!(stats[3].monthly_cashflow, -2000.0);
         assert_eq!(stats[11].monthly_cashflow, -2000.0);
+    }
+
+    #[test]
+    fn labeled_salary_loads_with_id() {
+        let yaml = "cash: 0\nevents:\n  - when: 0\n    type: job\n    id: partner\n    salary: { monthly: 6000, annualized_rate: 0.0 }";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        s.once();
+        assert_eq!(s.cashflow.len(), 1);
+        assert_eq!(s.cashflow[0].id.as_deref(), Some("partner"));
+    }
+
+    #[test]
+    fn end_removes_specific_salary() {
+        let yaml = "
+cash: 0
+events:
+  - { when: 0, type: job, id: me, salary: { monthly: 8000, annualized_rate: 0.0 } }
+  - { when: 0, type: job, id: partner, salary: { monthly: 6000, annualized_rate: 0.0 } }
+  - { when: 2, type: end, id: partner }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(4);
+        assert_eq!(stats[1].monthly_cashflow, 14000.0);
+        assert_eq!(stats[2].monthly_cashflow, 8000.0);
+        assert_eq!(stats[3].monthly_cashflow, 8000.0);
+    }
+
+    #[test]
+    fn end_stops_fund_contribution() {
+        let yaml = "
+cash: 0
+events:
+  - when: 0
+    type: investment
+    fund: { principal: 1000, annualized_rate: 0.0, investment: { id: 401k, investment: { monthly: 500 } } }
+  - { when: 2, type: end, id: 401k }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(3);
+        assert_eq!(stats[1].monthly_cashflow, -500.0);
+        assert_eq!(stats[2].monthly_cashflow, 0.0);
+        // principal keeps its past contributions, but no further ones land
+        assert_eq!(stats[2].assets_value, 2000.0);
+    }
+
+    #[test]
+    fn end_with_unknown_id_is_noop() {
+        let yaml = "cash: 100\nevents:\n  - { when: 1, type: end, id: ghost }\n";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(3);
+        assert_eq!(stats[3].cash, 100.0);
+        assert_eq!(stats[3].monthly_cashflow, 0.0);
     }
 
     fn write_tmp(name: &str, content: &str) -> std::path::PathBuf {
@@ -381,6 +494,7 @@ cash: 5000
 events:
   - when: 0
     type: job
+    id: main
     salary: { monthly: 8000, annualized_rate: 0.03 }
   - when: 0
     type: expense
@@ -389,13 +503,14 @@ events:
     type: layoff
   - when: 9
     type: investment
-    fund: { principal: 1000, annualized_rate: 0.05, investment: { investment: { monthly: 500 } } }
+    fund: { principal: 1000, annualized_rate: 0.05, investment: { id: 401k, investment: { monthly: 500 } } }
   - when: 12
     type: buy_home
     property: { sqft: 1200, price_per_sqft: 300, capex_per_sqft: 20, annualized_rate: 0.03, mortgage: { mortgage: { monthly: 1800, period: 240 } } }
   - when: 24
     type: buy_to_let
     property: { sqft: 900, price_per_sqft: 200, capex_per_sqft: 15, annualized_rate: 0.02, mortgage: { mortgage: { monthly: 1200, period: 120 } }, rental: { rental_income: { occupancy: 0.85, monthly: 2200, annualized_rate: 0.02 } } }
+  - { when: 24, type: end, id: 401k }
 "#;
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
@@ -404,9 +519,14 @@ events:
         assert_eq!(stats.len(), 25);
         // salary fired then was removed by layoff; rent remains
         assert_eq!(s.cashflow.len(), 1);
-        assert!(matches!(&s.cashflow[0], CashflowItem::Rent { monthly, .. } if *monthly > 2000.0));
+        assert!(matches!(&s.cashflow[0].item, CashflowItem::Rent { monthly, .. } if *monthly > 2000.0));
         // fund + home + rental property
         assert_eq!(s.assets.len(), 3);
+        // the 401k contribution was ended at month 24
+        match &s.assets[0] {
+            Asset::Fund { investment, .. } => assert!(investment.is_none()),
+            _ => panic!("expected fund as first asset"),
+        }
     }
 
     #[test]
@@ -417,7 +537,11 @@ events:
             .into_scenario();
         match &s.events[0].kind {
             EventType::BuyHome(Asset::Property {
-                mortgage: CashflowItem::Mortgage { paid, period, .. },
+                mortgage:
+                    Labeled {
+                        item: CashflowItem::Mortgage { paid, period, .. },
+                        ..
+                    },
                 ..
             }) => {
                 assert_eq!(*paid, 0);
