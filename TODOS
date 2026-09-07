@@ -1,0 +1,4 @@
+- [ ] add one-off expense cashflow type
+- [ ] add one-off income cashflow type
+- [ ] add cash reserve requirement (x months expense)
+- [ ] add expense payment precedence. use cash then fund then sell property when keeping the cash reserve requirement
