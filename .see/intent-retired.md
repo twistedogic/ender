@@ -42,3 +42,5 @@ scenario YAML schema (`scenario.yaml`), `openspec/specs/scenario-loading`,
 
 Done when: all seven TODOS are shipped, checked off in `TODOS`, and no
 archived `prd-*` proposal leaves meaningful ground uncovered.
+
+Retired 2026-09-09: all seven TODOs shipped (prd-1: one-off cashflows; prd-2: reserve + payment precedence; add-hk-tax: TODO 5; prd-3: --json; prd-4: TUI) — no meaningful ground left uncovered.
