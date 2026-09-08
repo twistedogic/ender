@@ -15,7 +15,7 @@ When `--json` is passed, the CLI SHALL write exactly one JSON document to stdout
 - **WHEN** a scenario goes insolvent and is run with `--json`
 - **THEN** the array's first element with `cash` below zero is the same month the text mode reports as insolvent, and the JSON contains no separate insolvency field
 
-#### Scenario: Piped text mode unchanged
+#### Scenario: Text mode unchanged
 - **WHEN** a scenario is run without `--json` and stdout is not a terminal (pipe or redirect)
 - **THEN** stdout is byte-for-byte the pre-TUI output: the summary line, plus the insolvent line when one exists
 
