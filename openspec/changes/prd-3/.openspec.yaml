@@ -1,0 +1,3 @@
+schema: spec-driven
+created: 2026-09-08
+goal: Emit the stats result as JSON on stdout via a --json CLI flag (intent TODO 6)
