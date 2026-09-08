@@ -29,3 +29,5 @@ scenario YAML schema (`scenario.yaml`), `openspec/specs/scenario-loading`.
 Done when: all four TODOS are shipped, checked off in `TODOS`, and no
 archived `prd-*` proposal leaves meaningful ground uncovered. Then
 retire this loop.
+
+Retired: all four TODOS shipped (prd-1: one-off cashflows; prd-2: reserve requirement and payment precedence with insolvency reporting); remaining steps are cosmetic.
