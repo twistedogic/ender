@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy)]
 enum Cashflow {
@@ -369,6 +369,7 @@ struct Event {
     kind: EventType,
 }
 
+#[derive(Serialize)]
 struct Stats {
     cash: f64,
     assets_value: f64,
@@ -555,10 +556,45 @@ fn load(path: &std::path::Path) -> Result<Scenario, String> {
     Ok(input.into_scenario())
 }
 
+/// Parse CLI args: first non-flag is the path (default `scenario.yaml`),
+/// `--json` may appear anywhere, any other `-`-prefixed arg is an error.
+fn parse_args(args: &[String]) -> Result<(String, bool), String> {
+    let mut path: Option<String> = None;
+    let mut json = false;
+    for a in args {
+        if a == "--json" {
+            json = true;
+        } else if a.starts_with('-') {
+            return Err(format!("unknown flag: {a}"));
+        } else if path.is_none() {
+            path = Some(a.clone());
+        }
+    }
+    Ok((path.unwrap_or_else(|| "scenario.yaml".to_string()), json))
+}
+
+/// Serialize the stats series as a compact JSON array: one object per
+/// simulated month with `month`, `cash`, `assets_value`, `monthly_cashflow`.
+fn stats_json(stats: &[Stats]) -> String {
+    #[derive(Serialize)]
+    struct Row<'a> {
+        month: usize,
+        #[serde(flatten)]
+        stats: &'a Stats,
+    }
+    let rows: Vec<Row> = stats.iter().enumerate().map(|(month, s)| Row { month, stats: s }).collect();
+    serde_json::to_string(&rows).expect("stats JSON never fails")
+}
+
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "scenario.yaml".to_string());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (path, json) = match parse_args(&args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
     let mut scenario = match load(std::path::Path::new(&path)) {
         Ok(s) => s,
         Err(e) => {
@@ -567,6 +603,10 @@ fn main() {
         }
     };
     let stats = scenario.run(360);
+    if json {
+        println!("{}", stats_json(&stats));
+        return;
+    }
     let last = stats.last().unwrap();
     println!(
         "after 360 months: cash {:.2}, assets {:.2}, monthly cashflow {:.2}",
@@ -1336,6 +1376,96 @@ events:
         assert_eq!(stats[10].assets_value, 9_000.0); // 11 top-ups of 1,000
         assert_eq!(stats[11].cash, 60_000.0); // tax covered by the draw
         assert_eq!(stats[11].assets_value, 4_240.0); // 9,000 - 1,000 - 3,760
+    }
+
+    // ---- CLI argument parsing (TODO 6) ----
+
+    #[test]
+    fn parse_args_defaults_to_scenario_yaml() {
+        let (path, json) = parse_args(&[]).unwrap();
+        assert_eq!(path, "scenario.yaml");
+        assert!(!json);
+    }
+
+    #[test]
+    fn parse_args_takes_explicit_path() {
+        let (path, json) = parse_args(&["s.yaml".to_string()]).unwrap();
+        assert_eq!(path, "s.yaml");
+        assert!(!json);
+    }
+
+    #[test]
+    fn parse_args_recognizes_json_alone() {
+        let (path, json) = parse_args(&["--json".to_string()]).unwrap();
+        assert_eq!(path, "scenario.yaml");
+        assert!(json);
+    }
+
+    #[test]
+    fn parse_args_recognizes_json_before_path() {
+        let (path, json) = parse_args(&["--json".to_string(), "s.yaml".to_string()]).unwrap();
+        assert_eq!(path, "s.yaml");
+        assert!(json);
+    }
+
+    #[test]
+    fn parse_args_recognizes_json_after_path() {
+        let (path, json) = parse_args(&["s.yaml".to_string(), "--json".to_string()]).unwrap();
+        assert_eq!(path, "s.yaml");
+        assert!(json);
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_flag_naming_it() {
+        let err = parse_args(&["--yaml".to_string()]).unwrap_err();
+        assert!(err.contains("--yaml"), "error should name the flag: {err}");
+    }
+
+    // ---- JSON series output (TODO 6) ----
+
+    #[test]
+    fn stats_json_emits_one_object_per_month_with_index() {
+        let yaml = "
+cash: 20000
+events:
+  - { when: 0, type: job, salary: { monthly: 8000, annualized_rate: 0.0 } }
+  - { when: 0, type: expense, rent: { monthly: 2000, annualized_rate: 0.0 } }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(12);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&stats_json(&stats)).unwrap();
+        assert_eq!(parsed.len(), 13);
+        for (i, obj) in parsed.iter().enumerate() {
+            assert_eq!(obj["month"], i);
+            assert!(obj["cash"].is_number());
+            assert!(obj["assets_value"].is_number());
+            assert!(obj["monthly_cashflow"].is_number());
+        }
+    }
+
+    #[test]
+    fn stats_json_final_element_matches_summary_line() {
+        let yaml = "
+cash: 20000
+events:
+  - { when: 0, type: job, salary: { monthly: 8000, annualized_rate: 0.0 } }
+  - { when: 0, type: expense, rent: { monthly: 2000, annualized_rate: 0.0 } }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(12);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&stats_json(&stats)).unwrap();
+        let last = parsed.last().unwrap();
+        let s_last = stats.last().unwrap();
+        assert_eq!(last["cash"].as_f64().unwrap(), s_last.cash);
+        assert_eq!(last["assets_value"].as_f64().unwrap(), s_last.assets_value);
+        assert_eq!(
+            last["monthly_cashflow"].as_f64().unwrap(),
+            s_last.monthly_cashflow
+        );
     }
 
 }
