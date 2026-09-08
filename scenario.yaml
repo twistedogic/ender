@@ -1,4 +1,5 @@
 cash: 20000
+reserve_months: 3
 events:
   - when: 0
     type: job

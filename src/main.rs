@@ -70,34 +70,36 @@ impl Default for CashflowItem {
 }
 
 impl CashflowItem {
-    fn monthly(&mut self) -> Cashflow {
+    /// Returns (cashflow, recurring_expense_contribution). The expense contribution
+    /// counts toward the reserve target; one-offs are excluded by `matches!`.
+    fn monthly(&mut self) -> (Cashflow, f64) {
         match self {
-            Self::Empty => Cashflow::Income(0.0),
-            Self::Investment { monthly } => Cashflow::Expense(*monthly),
+            Self::Empty => (Cashflow::Income(0.0), 0.0),
+            Self::Investment { monthly } => (Cashflow::Expense(*monthly), monthly.abs()),
             Self::Rent {
                 monthly,
                 annualized_rate,
             } => {
-                let m = monthly.clone();
+                let m = *monthly;
                 *monthly *= (1.0 + *annualized_rate).powf(1.0 / 12.0);
-                Cashflow::Expense(m)
+                (Cashflow::Expense(m), m.abs())
             }
             Self::Salary {
                 monthly,
                 annualized_rate,
             } => {
-                let m = monthly.clone();
+                let m = *monthly;
                 *monthly *= (1.0 + *annualized_rate).powf(1.0 / 12.0);
-                Cashflow::Income(m)
+                (Cashflow::Income(m), 0.0)
             }
             Self::RentalIncome {
                 occupancy,
                 monthly,
                 annualized_rate,
             } => {
-                let m = monthly.clone();
+                let m = *monthly;
                 *monthly *= (1.0 + *annualized_rate).powf(1.0 / 12.0);
-                Cashflow::Income(m * *occupancy)
+                (Cashflow::Income(m * *occupancy), 0.0)
             }
             Self::Mortgage {
                 period,
@@ -105,25 +107,25 @@ impl CashflowItem {
                 monthly,
             } => {
                 if paid >= period {
-                    return Cashflow::Expense(0.0);
+                    return (Cashflow::Expense(0.0), 0.0);
                 }
                 *paid += 1;
-                Cashflow::Expense(*monthly)
+                (Cashflow::Expense(*monthly), monthly.abs())
             }
             Self::Tuition {
                 monthly,
                 annualized_rate,
             } => {
-                let m = monthly.clone();
+                let m = *monthly;
                 *monthly *= (1.0 + *annualized_rate).powf(1.0 / 12.0);
-                Cashflow::Expense(m)
+                (Cashflow::Expense(m), m.abs())
             }
             Self::OneOff { amount, fired } => {
                 if *fired {
-                    return Cashflow::Income(0.0);
+                    return (Cashflow::Income(0.0), 0.0);
                 }
                 *fired = true;
-                Cashflow::new(*amount)
+                (Cashflow::new(*amount), 0.0)
             }
         }
     }
@@ -138,7 +140,7 @@ struct Labeled {
 }
 
 impl Labeled {
-    fn monthly(&mut self) -> Cashflow {
+    fn monthly(&mut self) -> (Cashflow, f64) {
         self.item.monthly()
     }
 }
@@ -173,7 +175,7 @@ impl Asset {
         }
     }
 
-    fn monthly(&mut self) -> Cashflow {
+    fn monthly(&mut self) -> (Cashflow, f64) {
         match self {
             Self::Property {
                 price_per_sqft,
@@ -183,14 +185,15 @@ impl Asset {
                 rental,
                 ..
             } => {
-                let rent_income = match rental {
+                let (rent_income, rent_base) = match rental {
                     Some(r) => r.monthly(),
-                    None => Cashflow::Income(0.0),
+                    None => (Cashflow::Income(0.0), 0.0),
                 };
+                let (mort_cf, mort_base) = mortgage.monthly();
                 let rate = (1.0 + *annualized_rate).powf(1.0 / 12.0);
                 *price_per_sqft *= rate;
                 *capex_per_sqft *= rate;
-                rent_income.add(mortgage.monthly())
+                (rent_income.add(mort_cf), mort_base + rent_base)
             }
             Self::Fund {
                 principal,
@@ -199,14 +202,14 @@ impl Asset {
             } => {
                 let rate = (1.0 + *annualized_rate).powf(1.0 / 12.0);
                 *principal *= rate;
-                let m = match investment {
+                let (cf, base) = match investment {
                     Some(i) => i.monthly(),
-                    None => Cashflow::Expense(0.0),
+                    None => (Cashflow::Expense(0.0), 0.0),
                 };
-                if let Cashflow::Expense(v) = m {
+                if let Cashflow::Expense(v) = cf {
                     *principal += v;
                 }
-                m
+                (cf, base)
             }
         }
     }
@@ -319,6 +322,7 @@ struct Scenario {
     cashflow: Vec<Labeled>,
     assets: Vec<Asset>,
     events: Vec<Event>,
+    reserve_months: u32,
 }
 
 impl Scenario {
@@ -344,23 +348,90 @@ impl Scenario {
                 i += 1;
             }
         }
-        let cashflow = self
-            .cashflow
-            .iter_mut()
-            .map(|flow| flow.monthly().value())
-            .sum::<f64>()
-            + self
-                .assets
-                .iter_mut()
-                .map(|flow| flow.monthly().value())
-                .sum::<f64>();
-        let assets_value = self.assets.iter_mut().map(|a| a.value()).sum();
+        let mut cashflow = 0.0;
+        let mut expense_base = 0.0;
+        for flow in self.cashflow.iter_mut() {
+            let (cf, base) = flow.monthly();
+            cashflow += cf.value();
+            expense_base += base;
+        }
+        for asset in self.assets.iter_mut() {
+            let (cf, base) = asset.monthly();
+            cashflow += cf.value();
+            expense_base += base;
+        }
         self.cash += cashflow;
+        self.settle(expense_base);
+        let assets_value = self.assets.iter().map(|a| a.value()).sum();
         self.at += 1;
         Stats {
             cash: self.cash,
             assets_value,
             monthly_cashflow: cashflow,
+        }
+    }
+
+    /// Restore the cash reserve by drawing funds, then selling properties.
+    /// Liquidation is a balance-sheet move: proceeds never appear in monthly_cashflow.
+    fn settle(&mut self, expense_base: f64) {
+        if self.reserve_months == 0 {
+            return;
+        }
+        let target = self.reserve_months as f64 * expense_base;
+        if self.cash >= target {
+            return;
+        }
+        let need = target - self.cash;
+        // Draw fund principals partially in asset order. Funds that hit zero
+        // drop out of the asset list (nothing left to settle against).
+        let mut drawn = 0.0;
+        let mut i = 0;
+        while i < self.assets.len() {
+            if drawn >= need {
+                break;
+            }
+            if let Asset::Fund { principal, .. } = &mut self.assets[i] {
+                let take = (need - drawn).min(*principal);
+                *principal -= take;
+                drawn += take;
+                if *principal <= 0.0 {
+                    self.assets.remove(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        self.cash += drawn;
+        if self.cash >= target {
+            return;
+        }
+        // Sell whole properties in asset order until target met or assets exhausted.
+        // Proceeds = market value - remaining mortgage face; surplus may overshoot.
+        let mut i = 0;
+        while i < self.assets.len() {
+            if self.cash >= target {
+                break;
+            }
+            if let Asset::Property {
+                sqft,
+                price_per_sqft,
+                mortgage,
+                ..
+            } = &mut self.assets[i]
+            {
+                let face = match &mortgage.item {
+                    CashflowItem::Mortgage {
+                        monthly,
+                        period,
+                        paid,
+                    } => monthly * (*period as f64 - *paid as f64),
+                    _ => 0.0,
+                };
+                self.cash += *sqft * *price_per_sqft - face;
+                self.assets.remove(i);
+                continue;
+            }
+            i += 1;
         }
     }
     fn run(&mut self, n: u16) -> Vec<Stats> {
@@ -375,6 +446,8 @@ impl Scenario {
 #[derive(Deserialize)]
 struct ScenarioInput {
     cash: f64,
+    #[serde(default)]
+    reserve_months: u32,
     events: Vec<Event>,
 }
 
@@ -386,6 +459,7 @@ impl ScenarioInput {
             cashflow: Vec::new(),
             assets: Vec::new(),
             events: self.events,
+            reserve_months: self.reserve_months,
         }
     }
 }
@@ -414,6 +488,9 @@ fn main() {
         "after 360 months: cash {:.2}, assets {:.2}, monthly cashflow {:.2}",
         last.cash, last.assets_value, last.monthly_cashflow
     );
+    if let Some((month, _)) = stats.iter().enumerate().find(|(_, s)| s.cash < 0.0) {
+        println!("insolvent from month {month}");
+    }
 }
 
 #[cfg(test)]
@@ -588,6 +665,7 @@ events:
                     },
                 }),
             }],
+            reserve_months: 0,
         };
         let stats = s.run(12);
         assert_eq!(stats.len(), 13);
@@ -799,6 +877,186 @@ events:
                 assert_eq!(*period, 12);
             }
             _ => panic!("expected mortgaged property"),
+        }
+    }
+
+    #[test]
+    fn reserve_loads_from_yaml() {
+        let yaml = "cash: 10000\nreserve_months: 3\nevents: []\n";
+        let s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        assert_eq!(s.reserve_months, 3);
+    }
+
+    #[test]
+    fn negative_reserve_fails_to_load() {
+        let path = write_tmp("ender_neg_reserve.yaml", "cash: 0\nreserve_months: -1\nevents: []\n");
+        let Err(err) = load(&path) else {
+            panic!("expected load to fail")
+        };
+        assert!(err.contains("ender_neg_reserve.yaml"), "error: {err}");
+    }
+
+    #[test]
+    fn cash_above_target_is_untouched() {
+        // reserve 3, cash 50000, rent 2000 -> target 6000, cash stays put
+        let yaml = "
+cash: 50000
+reserve_months: 3
+events:
+  - when: 0
+    type: expense
+    rent: { monthly: 2000, annualized_rate: 0.0 }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(0);
+        assert_eq!(stats[0].cash, 48000.0); // rent paid but no liquidation
+        assert!(s.assets.is_empty());
+    }
+
+    #[test]
+    fn absent_reserve_disables_settlement() {
+        // No reserve_months: cash goes negative, fund sits untouched.
+        let yaml = "
+cash: 50
+events:
+  - when: 0
+    type: expense
+    rent: { monthly: 200, annualized_rate: 0.0 }
+  - when: 0
+    type: investment
+    fund: { principal: 1000, annualized_rate: 0.0 }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(0);
+        assert_eq!(stats[0].cash, -1150.0); // 50 - 1000 fund - 200 rent; no settlement
+        match &s.assets[0] {
+            Asset::Fund { principal, .. } => assert_eq!(*principal, 1000.0), // untouched
+            _ => panic!("expected fund"),
+        }
+    }
+
+    #[test]
+    fn reserve_breached_only_when_assets_exhausted() {
+        // reserve 3, post-deduction cash 50, rent 200, fund 100, no properties.
+        // After rent: cash -150. Target 600, shortfall 750. Fund drawn to 0,
+        // cash -50. No assets left, reserve breached. Run reports insolvent.
+        let yaml = "
+cash: 150
+reserve_months: 3
+events:
+  - when: 0
+    type: expense
+    rent: { monthly: 200, annualized_rate: 0.0 }
+  - when: 0
+    type: investment
+    fund: { principal: 100, annualized_rate: 0.0 }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(0);
+        assert_eq!(stats[0].cash, -50.0);
+        assert!(s.assets.is_empty());
+    }
+
+    #[test]
+    fn property_sold_after_funds_exhausted() {
+        // reserve 3, post-deduction cash 100, rent 200, fund 100, property
+        // worth 30000 with mortgage 100/month over 12 periods (1100 remaining
+        // face after this month's payment).
+        // Event fire: cash = 30200 - 100 (fund) - 30000 (property) = 100.
+        // Month flow: rent -200, mortgage -100 -> cashflow -300, cash -200.
+        // Settle: target = 3 * (rent + mortgage) = 900; shortfall 1100.
+        // Draw 100 from fund (principal 0), cash = -100. Sell property for 28900.
+        // Cash 28800. Next month: rent only -200.
+        let yaml = "
+cash: 30200
+reserve_months: 3
+events:
+  - when: 0
+    type: expense
+    rent: { monthly: 200, annualized_rate: 0.0 }
+  - when: 0
+    type: investment
+    fund: { principal: 100, annualized_rate: 0.0 }
+  - when: 0
+    type: buy_home
+    property: { sqft: 300, price_per_sqft: 100, capex_per_sqft: 0, annualized_rate: 0.0, mortgage: { mortgage: { monthly: 100, period: 12 } } }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(1);
+        assert_eq!(stats[0].cash, 28800.0);
+        assert!(s.assets.is_empty());
+        // next month: rent only -200 (property's mortgage flow is gone)
+        assert_eq!(stats[1].monthly_cashflow, -200.0);
+    }
+
+    #[test]
+    fn one_off_does_not_inflate_reserve_target() {
+        // Spec: reserve 3, post-deduction cash 8000, rent 2000, fund 10000,
+        // one_off_expense 5000 at month 0. Cash should end at 6000 (target = 3*2000
+        // = 6000, shortfall 5000), proving the one-off is excluded from the base.
+        // YAML cash = 18000 so the 10000 principal deduction leaves 8000.
+        let yaml = "
+cash: 18000
+reserve_months: 3
+events:
+  - when: 0
+    type: expense
+    rent: { monthly: 2000, annualized_rate: 0.0 }
+  - when: 0
+    type: investment
+    fund: { principal: 10000, annualized_rate: 0.0 }
+  - when: 0
+    type: one_off_expense
+    one_off: { amount: 5000 }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(0);
+        assert_eq!(stats[0].cash, 6000.0);
+        assert_eq!(stats[0].monthly_cashflow, -7000.0); // rent -2000 + one-off -5000
+        match &s.assets[0] {
+            Asset::Fund { principal, .. } => assert_eq!(*principal, 5000.0), // drew 5000
+            _ => panic!("expected fund"),
+        }
+    }
+
+    #[test]
+    fn fund_drawn_to_top_up_reserve() {
+        // reserve 3, post-deduction cash 100, rent 200, fund 1000
+        // YAML cash is 1100 so the principal deduction leaves 100 on hand.
+        // After rent: cash -100; target = 3*200 = 600; shortfall 700; draw 700 from fund.
+        // Cash ends 600, fund principal ends 300, monthly_cashflow -200.
+        let yaml = "
+cash: 1100
+reserve_months: 3
+events:
+  - when: 0
+    type: expense
+    rent: { monthly: 200, annualized_rate: 0.0 }
+  - when: 0
+    type: investment
+    fund: { principal: 1000, annualized_rate: 0.0 }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario();
+        let stats = s.run(0);
+        assert_eq!(stats[0].cash, 600.0);
+        assert_eq!(stats[0].monthly_cashflow, -200.0);
+        match &s.assets[0] {
+            Asset::Fund { principal, .. } => assert_eq!(*principal, 300.0),
+            _ => panic!("expected fund"),
         }
     }
 
