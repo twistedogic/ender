@@ -26,6 +26,53 @@ impl Cashflow {
     }
 }
 
+// Hong Kong tax parameters (Inland Revenue Department, year of
+// assessment 2024/25). ponytail: constants, not config — update when
+// the IRD moves them (basic allowance rises to 145,000 in 2026/27).
+const BASIC_ALLOWANCE: f64 = 132_000.0;
+const MPF_RATE: f64 = 0.05;
+const MPF_CAP: f64 = 1_500.0;
+const PROGRESSIVE_BRACKETS: [(f64, f64); 5] = [
+    (50_000.0, 0.02),
+    (50_000.0, 0.06),
+    (50_000.0, 0.10),
+    (50_000.0, 0.14),
+    (f64::INFINITY, 0.17),
+];
+const STANDARD_RATES: [(f64, f64); 2] = [(5_000_000.0, 0.15), (f64::INFINITY, 0.16)];
+const RENTAL_REPAIR_ALLOWANCE: f64 = 0.8;
+const PROPERTY_TAX_RATE: f64 = 0.15;
+
+/// Employee Mandatory Provident Fund (MPF) contribution for one month.
+fn mpf_monthly(gross: f64) -> f64 {
+    (gross * MPF_RATE).min(MPF_CAP)
+}
+
+fn bracket_tax(income: f64, brackets: &[(f64, f64)]) -> f64 {
+    let (mut tax, mut left) = (0.0, income);
+    for &(width, rate) in brackets {
+        let take = left.min(width);
+        tax += take * rate;
+        left -= take;
+    }
+    tax
+}
+
+/// Hong Kong salaries tax on a year's accrual: the lower of progressive
+/// tax on net chargeable income and standard-rate tax on net assessable
+/// income.
+fn salaries_tax(gross: f64, mpf: f64, basic_allowance: f64) -> f64 {
+    let nai = (gross - mpf).max(0.0);
+    let progressive = bracket_tax((nai - basic_allowance).max(0.0), &PROGRESSIVE_BRACKETS);
+    let standard = bracket_tax(nai, &STANDARD_RATES);
+    progressive.min(standard)
+}
+
+/// Hong Kong property tax: 15% of rent after the 20% repair allowance.
+fn property_tax(rent: f64) -> f64 {
+    rent * RENTAL_REPAIR_ALLOWANCE * PROPERTY_TAX_RATE
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CashflowItem {
@@ -90,7 +137,7 @@ impl CashflowItem {
             } => {
                 let m = *monthly;
                 *monthly *= (1.0 + *annualized_rate).powf(1.0 / 12.0);
-                (Cashflow::Income(m), 0.0)
+                (Cashflow::Income(m - mpf_monthly(m)), 0.0)
             }
             Self::RentalIncome {
                 occupancy,
@@ -127,6 +174,18 @@ impl CashflowItem {
                 *fired = true;
                 (Cashflow::new(*amount), 0.0)
             }
+        }
+    }
+
+    /// (salary gross, rent collected) for annual tax accrual. Reads
+    /// pre-mutation amounts — call before `monthly()` grows them.
+    fn tax_accrual(&self) -> (f64, f64) {
+        match self {
+            Self::Salary { monthly, .. } => (*monthly, 0.0),
+            Self::RentalIncome {
+                monthly, occupancy, ..
+            } => (0.0, monthly * occupancy),
+            _ => (0.0, 0.0),
         }
     }
 }
@@ -323,6 +382,10 @@ struct Scenario {
     assets: Vec<Asset>,
     events: Vec<Event>,
     reserve_months: u32,
+    // Accruals since the last annual tax charge (months 11, 23, 35, ...).
+    salary_accrued: f64,
+    mpf_accrued: f64,
+    rent_accrued: f64,
 }
 
 impl Scenario {
@@ -351,16 +414,34 @@ impl Scenario {
         let mut cashflow = 0.0;
         let mut expense_base = 0.0;
         for flow in self.cashflow.iter_mut() {
+            let (gross, rent) = flow.item.tax_accrual();
             let (cf, base) = flow.monthly();
             cashflow += cf.value();
             expense_base += base;
+            self.salary_accrued += gross;
+            self.mpf_accrued += mpf_monthly(gross);
+            self.rent_accrued += rent;
         }
         for asset in self.assets.iter_mut() {
+            let (_, rent) = match asset {
+                Asset::Property { rental: Some(r), .. } => r.item.tax_accrual(),
+                _ => (0.0, 0.0),
+            };
             let (cf, base) = asset.monthly();
             cashflow += cf.value();
             expense_base += base;
+            self.rent_accrued += rent;
         }
         self.cash += cashflow;
+        if self.at % 12 == 11 {
+            // Charged before settlement so the bill participates in reserve
+            // restoration like any other expense.
+            self.cash -= salaries_tax(self.salary_accrued, self.mpf_accrued, BASIC_ALLOWANCE)
+                + property_tax(self.rent_accrued);
+            self.salary_accrued = 0.0;
+            self.mpf_accrued = 0.0;
+            self.rent_accrued = 0.0;
+        }
         self.settle(expense_base);
         let assets_value = self.assets.iter().map(|a| a.value()).sum();
         self.at += 1;
@@ -460,6 +541,9 @@ impl ScenarioInput {
             assets: Vec::new(),
             events: self.events,
             reserve_months: self.reserve_months,
+            salary_accrued: 0.0,
+            mpf_accrued: 0.0,
+            rent_accrued: 0.0,
         }
     }
 }
@@ -563,9 +647,9 @@ events:
             .unwrap()
             .into_scenario();
         let stats = s.run(3);
-        assert_eq!(stats[1].monthly_cashflow, 14000.0);
-        assert_eq!(stats[2].monthly_cashflow, 8000.0);
-        assert_eq!(stats[3].monthly_cashflow, 8000.0);
+        assert_eq!(stats[1].monthly_cashflow, 13300.0); // net of MPF
+        assert_eq!(stats[2].monthly_cashflow, 7600.0);
+        assert_eq!(stats[3].monthly_cashflow, 7600.0);
     }
 
     #[test]
@@ -581,8 +665,8 @@ events:
             .unwrap()
             .into_scenario();
         let stats = s.run(2);
-        assert_eq!(stats[1].monthly_cashflow, 6000.0);
-        assert_eq!(stats[2].monthly_cashflow, 6000.0);
+        assert_eq!(stats[1].monthly_cashflow, 5700.0);
+        assert_eq!(stats[2].monthly_cashflow, 5700.0);
     }
 
     #[test]
@@ -615,8 +699,8 @@ events:
             .unwrap()
             .into_scenario();
         let stats = s.run(2);
-        assert_eq!(stats[1].cash, 16100.0); // no-op: both months paid
-        assert_eq!(stats[2].monthly_cashflow, 8000.0);
+        assert_eq!(stats[1].cash, 15300.0); // no-op: both months paid, net of MPF
+        assert_eq!(stats[2].monthly_cashflow, 7600.0);
     }
 
     #[test]
@@ -666,6 +750,9 @@ events:
                 }),
             }],
             reserve_months: 0,
+            salary_accrued: 0.0,
+            mpf_accrued: 0.0,
+            rent_accrued: 0.0,
         };
         let stats = s.run(12);
         assert_eq!(stats.len(), 13);
@@ -698,9 +785,9 @@ events:
             .unwrap()
             .into_scenario();
         let stats = s.run(4);
-        assert_eq!(stats[1].monthly_cashflow, 14000.0);
-        assert_eq!(stats[2].monthly_cashflow, 8000.0);
-        assert_eq!(stats[3].monthly_cashflow, 8000.0);
+        assert_eq!(stats[1].monthly_cashflow, 13300.0); // net of MPF
+        assert_eq!(stats[2].monthly_cashflow, 7600.0);
+        assert_eq!(stats[3].monthly_cashflow, 7600.0);
     }
 
     #[test]
@@ -1081,4 +1168,174 @@ events:
         };
         assert!(err.contains("ender_malformed.yaml"), "error: {err}");
     }
+
+    // ---- Hong Kong tax: pure math (IRD worked examples) ----
+
+    #[test]
+    fn mpf_below_cap_is_five_percent() {
+        assert_eq!(mpf_monthly(20_000.0), 1_000.0);
+    }
+
+    #[test]
+    fn mpf_capped_at_1500() {
+        assert_eq!(mpf_monthly(40_000.0), 1_500.0);
+    }
+
+    #[test]
+    fn salaries_tax_ird_progressive_example() {
+        // gross 350k, MPF 18k, allowance 132k: chargeable 200k
+        // progressive 16,000 vs standard 332k x 15% = 49,800
+        assert_eq!(salaries_tax(350_000.0, 18_000.0, BASIC_ALLOWANCE), 16_000.0);
+    }
+
+    #[test]
+    fn salaries_tax_zero_below_allowance() {
+        assert_eq!(salaries_tax(100_000.0, 5_000.0, BASIC_ALLOWANCE), 0.0);
+    }
+
+    #[test]
+    fn salaries_tax_two_tier_standard_rate_wins_high_income() {
+        // net assessable income 7,982,000: 15% on first 5M + 16% on rest
+        // = 1,227,120 (progressive would be 1,316,500)
+        assert_eq!(
+            salaries_tax(8_000_000.0, 18_000.0, BASIC_ALLOWANCE),
+            1_227_120.0
+        );
+    }
+
+    #[test]
+    fn salaries_tax_allowance_override() {
+        // 320k gross, 18k MPF, 145k allowance: chargeable 157k
+        // -> 1,000 + 3,000 + 5,000 + 980 = 9,980
+        assert_eq!(salaries_tax(320_000.0, 18_000.0, 145_000.0), 9_980.0);
+    }
+
+    #[test]
+    fn property_tax_on_repair_allowed_rent() {
+        assert_eq!(property_tax(300_000.0), 36_000.0);
+        assert_eq!(property_tax(0.0), 0.0);
+    }
+
+    // ---- HK tax: integration ----
+
+    fn scenario(yaml: &str) -> Scenario {
+        serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario()
+    }
+
+    #[test]
+    fn salary_cashflow_is_net_of_mpf() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: job, salary: { monthly: 20000, annualized_rate: 0.0 } }",
+        );
+        let stats = s.run(1);
+        assert_eq!(stats[0].monthly_cashflow, 19_000.0);
+        assert_eq!(stats[1].monthly_cashflow, 19_000.0);
+    }
+
+    #[test]
+    fn salary_cashflow_mpf_capped() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: job, salary: { monthly: 40000, annualized_rate: 0.0 } }",
+        );
+        let stats = s.run(0);
+        assert_eq!(stats[0].monthly_cashflow, 38_500.0);
+    }
+
+    #[test]
+    fn salaries_tax_charged_at_block_end() {
+        // 20k gross/mo: accrued 240k, MPF 12k, chargeable 96k -> tax 3,760
+        let mut s = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: job, salary: { monthly: 20000, annualized_rate: 0.0 } }",
+        );
+        let stats = s.run(11);
+        assert_eq!(stats[10].cash, 209_000.0); // 11 net months, no tax yet
+        assert_eq!(stats[11].cash, 224_240.0); // 12 net months - 3,760
+    }
+
+    #[test]
+    fn consecutive_blocks_taxed_identically() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: job, salary: { monthly: 20000, annualized_rate: 0.0 } }",
+        );
+        let stats = s.run(23);
+        assert_eq!(stats[11].cash - stats[10].cash, 19_000.0 - 3_760.0);
+        assert_eq!(stats[23].cash - stats[22].cash, 19_000.0 - 3_760.0);
+        assert_eq!(stats[23].cash, 448_480.0);
+    }
+
+    #[test]
+    fn partial_block_after_layoff_taxes_accrued_months_only() {
+        // 25k gross for 6 of 12 months: accrued 150k, MPF 7.5k,
+        // chargeable 10.5k -> tax 210 (full year would be 9,420)
+        let mut s = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: job, salary: { monthly: 25000, annualized_rate: 0.0 } }
+  - { when: 6, type: layoff }",
+        );
+        let stats = s.run(11);
+        assert_eq!(stats[11].cash, 6.0 * 23_750.0 - 210.0);
+    }
+
+    #[test]
+    fn property_tax_uses_occupancy_adjusted_accrual() {
+        // rent 10k at occupancy 0.5: accrued 60k, tax 7,200
+        let mut s = scenario(
+            "
+cash: 10100
+events:
+  - when: 0
+    type: buy_to_let
+    property: { sqft: 100, price_per_sqft: 100, capex_per_sqft: 0, annualized_rate: 0.0, mortgage: { mortgage: { monthly: 0, period: 1 } }, rental: { rental_income: { occupancy: 0.5, monthly: 10000, annualized_rate: 0.0 } } }",
+        );
+        let stats = s.run(11);
+        assert_eq!(stats[11].cash, 100.0 + 12.0 * 5_000.0 - 7_200.0);
+    }
+
+    #[test]
+    fn combined_salary_and_rent_bill_at_block_end() {
+        // salaries tax 3,760 + property tax 36,000 in one deduction
+        let mut s = scenario(
+            "
+cash: 10000
+events:
+  - { when: 0, type: job, salary: { monthly: 20000, annualized_rate: 0.0 } }
+  - when: 0
+    type: buy_to_let
+    property: { sqft: 100, price_per_sqft: 100, capex_per_sqft: 0, annualized_rate: 0.0, mortgage: { mortgage: { monthly: 0, period: 1 } }, rental: { rental_income: { occupancy: 1.0, monthly: 25000, annualized_rate: 0.0 } } }",
+        );
+        let stats = s.run(11);
+        assert_eq!(stats[11].cash, 12.0 * 44_000.0 - 3_760.0 - 36_000.0);
+    }
+
+    #[test]
+    fn tax_charge_precedes_reserve_settlement() {
+        // reserve 3 x rent 20k = 60k target; net flow -1,000/mo topped up
+        // from the fund. Month-11 tax 3,760 must join that month's draw.
+        let mut s = scenario(
+            "
+cash: 80000
+reserve_months: 3
+events:
+  - { when: 0, type: job, salary: { monthly: 20000, annualized_rate: 0.0 } }
+  - { when: 0, type: expense, rent: { monthly: 20000, annualized_rate: 0.0 } }
+  - { when: 0, type: investment, fund: { principal: 20000, annualized_rate: 0.0 } }",
+        );
+        let stats = s.run(11);
+        assert_eq!(stats[10].cash, 60_000.0);
+        assert_eq!(stats[10].assets_value, 9_000.0); // 11 top-ups of 1,000
+        assert_eq!(stats[11].cash, 60_000.0); // tax covered by the draw
+        assert_eq!(stats[11].assets_value, 4_240.0); // 9,000 - 1,000 - 3,760
+    }
+
 }

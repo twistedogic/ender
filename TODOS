@@ -2,3 +2,4 @@
 - [x] add one-off income cashflow type
 - [x] add cash reserve requirement (x months expense)
 - [x] add expense payment precedence. use cash then fund then sell property when keeping the cash reserve requirement
+- [x] add hk salaries/property tax charged every 12 months (BREAKING: salary cashflow now net of MPF)
