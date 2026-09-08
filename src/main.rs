@@ -1,4 +1,8 @@
+use std::io::IsTerminal;
+
 use serde::{Deserialize, Serialize};
+
+mod tui;
 
 #[derive(Clone, Copy)]
 enum Cashflow {
@@ -586,6 +590,66 @@ fn stats_json(stats: &[Stats]) -> String {
     serde_json::to_string(&rows).expect("stats JSON never fails")
 }
 
+/// Derived run-level statistics shown by the TUI header. Insolvency uses the
+/// same `cash < 0.0` rule as the text summary; the minimum is reported with
+/// the first month it occurs at (ties go to the earliest month).
+struct KeyStats {
+    final_cash: f64,
+    final_assets_value: f64,
+    final_monthly_cashflow: f64,
+    min_cash: f64,
+    min_cash_month: usize,
+    first_insolvent_month: Option<usize>,
+}
+
+fn key_stats(stats: &[Stats]) -> KeyStats {
+    if stats.is_empty() {
+        return KeyStats {
+            final_cash: 0.0,
+            final_assets_value: 0.0,
+            final_monthly_cashflow: 0.0,
+            min_cash: 0.0,
+            min_cash_month: 0,
+            first_insolvent_month: None,
+        };
+    }
+    let last = stats.last().unwrap();
+    let mut min_cash = stats[0].cash;
+    let mut min_cash_month = 0;
+    let mut first_insolvent = None;
+    for (i, s) in stats.iter().enumerate() {
+        if s.cash < min_cash {
+            min_cash = s.cash;
+            min_cash_month = i;
+        }
+        if first_insolvent.is_none() && s.cash < 0.0 {
+            first_insolvent = Some(i);
+        }
+    }
+    KeyStats {
+        final_cash: last.cash,
+        final_assets_value: last.assets_value,
+        final_monthly_cashflow: last.monthly_cashflow,
+        min_cash,
+        min_cash_month,
+        first_insolvent_month: first_insolvent,
+    }
+}
+
+/// Format the non-terminal human summary byte-for-byte the way `main` always
+/// has: the final-month line, then the insolvent line when one exists.
+fn format_text_summary(stats: &[Stats]) -> String {
+    let last = stats.last().unwrap();
+    let mut out = format!(
+        "after 360 months: cash {:.2}, assets {:.2}, monthly cashflow {:.2}\n",
+        last.cash, last.assets_value, last.monthly_cashflow
+    );
+    if let Some((month, _)) = stats.iter().enumerate().find(|(_, s)| s.cash < 0.0) {
+        out.push_str(&format!("insolvent from month {month}\n"));
+    }
+    out
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (path, json) = match parse_args(&args) {
@@ -607,14 +671,14 @@ fn main() {
         println!("{}", stats_json(&stats));
         return;
     }
-    let last = stats.last().unwrap();
-    println!(
-        "after 360 months: cash {:.2}, assets {:.2}, monthly cashflow {:.2}",
-        last.cash, last.assets_value, last.monthly_cashflow
-    );
-    if let Some((month, _)) = stats.iter().enumerate().find(|(_, s)| s.cash < 0.0) {
-        println!("insolvent from month {month}");
+    if std::io::stdout().is_terminal() {
+        if let Err(e) = tui::run(&stats) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
     }
+    print!("{}", format_text_summary(&stats));
 }
 
 #[cfg(test)]
@@ -1419,6 +1483,98 @@ events:
     fn parse_args_rejects_unknown_flag_naming_it() {
         let err = parse_args(&["--yaml".to_string()]).unwrap_err();
         assert!(err.contains("--yaml"), "error should name the flag: {err}");
+    }
+
+    // ---- Key statistics helper (TODO 7) ----
+
+    fn s(cash: f64, assets_value: f64, cashflow: f64) -> Stats {
+        Stats {
+            cash,
+            assets_value,
+            monthly_cashflow: cashflow,
+        }
+    }
+
+    #[test]
+    fn key_stats_returns_final_values() {
+        let stats = vec![s(100.0, 50.0, 25.0), s(75.0, 60.0, -25.0)];
+        let k = key_stats(&stats);
+        assert_eq!(k.final_cash, 75.0);
+        assert_eq!(k.final_assets_value, 60.0);
+        assert_eq!(k.final_monthly_cashflow, -25.0);
+    }
+
+    #[test]
+    fn key_stats_finds_min_cash_with_month() {
+        let stats = vec![s(100.0, 0.0, 0.0), s(50.0, 0.0, 0.0), s(-200.0, 0.0, 0.0), s(80.0, 0.0, 0.0)];
+        let k = key_stats(&stats);
+        assert_eq!(k.min_cash, -200.0);
+        assert_eq!(k.min_cash_month, 2);
+    }
+
+    #[test]
+    fn key_stats_min_cash_ties_pick_first_month() {
+        let stats = vec![s(50.0, 0.0, 0.0), s(100.0, 0.0, 0.0), s(50.0, 0.0, 0.0)];
+        let k = key_stats(&stats);
+        assert_eq!(k.min_cash, 50.0);
+        assert_eq!(k.min_cash_month, 0);
+    }
+
+    #[test]
+    fn key_stats_finds_first_insolvent_month() {
+        let stats = vec![s(100.0, 0.0, 0.0), s(-1.0, 0.0, 0.0), s(-50.0, 0.0, 0.0)];
+        let k = key_stats(&stats);
+        assert_eq!(k.first_insolvent_month, Some(1));
+    }
+
+    #[test]
+    fn key_stats_no_insolvent_is_none() {
+        let stats = vec![s(100.0, 0.0, 0.0), s(50.0, 0.0, 0.0), s(0.0, 0.0, 0.0)];
+        let k = key_stats(&stats);
+        assert_eq!(k.first_insolvent_month, None);
+    }
+
+    #[test]
+    fn key_stats_empty_series() {
+        let k = key_stats(&[]);
+        assert_eq!(k.final_cash, 0.0);
+        assert_eq!(k.final_assets_value, 0.0);
+        assert_eq!(k.final_monthly_cashflow, 0.0);
+        assert_eq!(k.min_cash, 0.0);
+        assert_eq!(k.min_cash_month, 0);
+        assert_eq!(k.first_insolvent_month, None);
+    }
+
+    #[test]
+    fn format_text_summary_pipes_byte_for_byte() {
+        // The non-terminal text path must reproduce the pre-TUI summary byte-for-byte.
+        let stats = vec![s(100.0, 50.0, 25.0), s(75.0, 60.0, -25.0)];
+        let out = format_text_summary(&stats);
+        assert_eq!(
+            out,
+            "after 360 months: cash 75.00, assets 60.00, monthly cashflow -25.00\n"
+        );
+    }
+
+    #[test]
+    fn format_text_summary_appends_insolvent_line() {
+        let stats = vec![s(100.0, 0.0, 0.0), s(-1.0, 0.0, 0.0), s(50.0, 0.0, 0.0)];
+        let out = format_text_summary(&stats);
+        assert_eq!(
+            out,
+            "after 360 months: cash 50.00, assets 0.00, monthly cashflow 0.00\n\
+             insolvent from month 1\n"
+        );
+    }
+
+    #[test]
+    fn format_text_summary_omits_insolvent_line_when_solvent() {
+        let stats = vec![s(100.0, 0.0, 0.0), s(50.0, 0.0, 0.0), s(0.5, 0.0, 0.0)];
+        let out = format_text_summary(&stats);
+        assert_eq!(
+            out,
+            "after 360 months: cash 0.50, assets 0.00, monthly cashflow 0.00\n"
+        );
     }
 
     // ---- JSON series output (TODO 6) ----

@@ -4,4 +4,4 @@
 - [x] add expense payment precedence. use cash then fund then sell property when keeping the cash reserve requirement
 - [x] add hk salaries/property tax charged every 12 months (BREAKING: salary cashflow now net of MPF)
 - [x] add cli flag `--json` for showing stats result in json
-- [ ] add ratatui tui for displaying result with key statistics about the all stats if `--json` is not provided
+- [x] add ratatui tui for displaying result with key statistics about the all stats if `--json` is not provided
