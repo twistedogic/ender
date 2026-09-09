@@ -1,3 +1,8 @@
+## Purpose
+
+Compute Hong Kong property tax (15% of 80% of annual rent) charged
+annually to scenario cash in the same block as salaries tax.
+
 ## Requirements
 
 ### Requirement: Property tax charged annually on accrued rent

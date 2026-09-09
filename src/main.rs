@@ -77,7 +77,102 @@ fn property_tax(rent: f64) -> f64 {
     rent * RENTAL_REPAIR_ALLOWANCE * PROPERTY_TAX_RATE
 }
 
-#[derive(Deserialize)]
+/// HK 2026/27 household allowance knobs (IRD year of assessment 2026/27).
+/// ponytail: constants — single edit point when IRD revises them.
+const MARRIED_BASIC: f64 = 290_000.0;
+const SINGLE_BASIC: f64 = 145_000.0;
+const CHILD_ALLOWANCE: f64 = 140_000.0;
+const PARENT_60_PLUS: f64 = 55_000.0;
+const PARENT_55_TO_59: f64 = 27_500.0;
+
+#[derive(Deserialize, Clone, Copy, Default, Debug)]
+#[serde(rename_all = "snake_case")]
+enum MaritalStatus {
+    #[default]
+    Single,
+    Married,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug)]
+enum AgeBand {
+    #[serde(rename = "55-59")]
+    FiftyFiveToFiftyNine,
+    #[serde(rename = "60+")]
+    SixtyPlus,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct ParentConfig {
+    age_band: AgeBand,
+    #[serde(default)]
+    living_with: bool,
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
+struct TaxConfig {
+    #[serde(default)]
+    status: Option<MaritalStatus>,
+    #[serde(default)]
+    children: u32,
+    #[serde(default)]
+    parents: Vec<ParentConfig>,
+}
+
+impl TaxConfig {
+    /// Non-empty when any field is present — used to decide whether to
+    /// override the default `BASIC_ALLOWANCE`. An empty tax block
+    /// (`tax: {}`) is treated as absent.
+    fn is_non_trivial(&self) -> bool {
+        self.status.is_some() || self.children > 0 || !self.parents.is_empty()
+    }
+    /// Total allowances derived from household composition (2026/27 IRD).
+    /// basic by status (defaults to single), child × 140,000, parents per
+    /// age band, doubled when living_with.
+    fn annual_basic(&self) -> f64 {
+        let basic = match self.status {
+            Some(MaritalStatus::Married) => MARRIED_BASIC,
+            Some(MaritalStatus::Single) => SINGLE_BASIC,
+            None => SINGLE_BASIC,
+        };
+        let children = self.children as f64 * CHILD_ALLOWANCE;
+        let parents: f64 = self
+            .parents
+            .iter()
+            .map(|p| {
+                let base = match p.age_band {
+                    AgeBand::SixtyPlus => PARENT_60_PLUS,
+                    AgeBand::FiftyFiveToFiftyNine => PARENT_55_TO_59,
+                };
+                if p.living_with { base * 2.0 } else { base }
+            })
+            .sum();
+        basic + children + parents
+    }
+}
+
+/// Parse `"YYYY-MM"` into `(year, month)` for horizon / saving fields.
+/// ponytail: tiny parser — no calendar library, sim has no calendar.
+fn parse_ym(s: &str) -> Result<(i32, u32), String> {
+    let (y, m) = s.split_once('-').ok_or_else(|| format!("invalid date {s:?}"))?;
+    let y: i32 = y.parse().map_err(|_| format!("invalid year in {s:?}"))?;
+    let m: u32 = m.parse().map_err(|_| format!("invalid month in {s:?}"))?;
+    if !(1..=12).contains(&m) {
+        return Err(format!("month out of range in {s:?}"));
+    }
+    Ok((y, m))
+}
+
+/// Months between two `YYYY-MM` dates, inclusive of both endpoints.
+fn months_between(start: (i32, u32), end: (i32, u32)) -> Result<u32, String> {
+    if end.0 < start.0 || (end.0 == start.0 && end.1 < start.1) {
+        return Err(format!("end {end:?} precedes start {start:?}"));
+    }
+    Ok(((end.0 - start.0) * 12 + (end.1 as i32 - start.1 as i32)) as u32)
+}
+
+#[derive(Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 enum CashflowItem {
     Salary {
@@ -194,7 +289,7 @@ impl CashflowItem {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct Labeled {
     #[serde(default)]
     id: Option<String>,
@@ -208,7 +303,7 @@ impl Labeled {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 enum Asset {
     Fund {
@@ -223,10 +318,22 @@ enum Asset {
         annualized_rate: f64,
         mortgage: Labeled,
         rental: Option<Labeled>,
+        /// Cash paid upfront; when set, this is the amount deducted at
+        /// purchase time instead of the full `sqft * price_per_sqft`.
+        /// Defaults to None (full price deducted, original behavior).
+        #[serde(default)]
+        down: Option<f64>,
     },
 }
 
 impl Asset {
+    /// Cash deducted at purchase time: `down` when set, full price otherwise.
+    fn purchase_cost(&self) -> f64 {
+        match self {
+            Self::Property { down: Some(d), .. } => *d,
+            _ => self.value(),
+        }
+    }
     fn value(&self) -> f64 {
         match self {
             Self::Fund { principal, .. } => *principal,
@@ -278,7 +385,7 @@ impl Asset {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum EventType {
     Job(Labeled),
@@ -296,6 +403,29 @@ enum EventType {
     OneOffExpense(Labeled),
     OneOffIncome(Labeled),
     End { id: String },
+    /// One-shot percentage drop to funds and/or properties in the firing
+    /// month. No cashflow; the post-drop base resumes monthly growth.
+    /// `rent_drop` is applied to any property's rental income monthly.
+    Downturn {
+        #[serde(default)]
+        equity_drop: f64,
+        #[serde(default)]
+        property_drop: f64,
+        #[serde(default)]
+        rent_drop: f64,
+    },
+    /// Replace a mortgage's `monthly` payment by id. No-op when no asset's
+    /// mortgage matches; missing id fails at load.
+    Refinance { id: String, monthly: f64 },
+    /// Update a salary's monthly + annualized rate. With `id`, targets the
+    /// first cashflow item carrying that id; without, the first salary.
+    /// Used for void's `pay-change` events.
+    PayChange {
+        monthly: f64,
+        annualized_rate: f64,
+        #[serde(default)]
+        id: Option<String>,
+    },
 }
 
 impl EventType {
@@ -308,7 +438,7 @@ impl EventType {
             ),
             Self::Expense(e) => s.cashflow.push(e),
             Self::BuyHome(a) | Self::BuyToLet(a) | Self::Investment(a) => {
-                s.cash -= a.value();
+                s.cash -= a.purchase_cost();
                 s.assets.push(a);
             }
             Self::Tuition(i) => s.cashflow.push(i),
@@ -362,11 +492,77 @@ impl EventType {
                     }
                 }
             }
+            Self::Downturn {
+                equity_drop,
+                property_drop,
+                rent_drop,
+            } => {
+                for asset in &mut s.assets {
+                    match asset {
+                        Asset::Fund { principal, .. } => {
+                            *principal *= 1.0 - equity_drop;
+                        }
+                        Asset::Property {
+                            price_per_sqft,
+                            rental,
+                            ..
+                        } => {
+                            *price_per_sqft *= 1.0 - property_drop;
+                            if let Some(r) = rental.as_mut() {
+                                if let CashflowItem::RentalIncome { monthly: m, .. } = &mut r.item
+                                {
+                                    *m *= 1.0 - rent_drop;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Self::Refinance { id, monthly } => {
+                for asset in &mut s.assets {
+                    if let Asset::Property { mortgage, .. } = asset {
+                        if mortgage.id.as_deref() == Some(&id) {
+                            if let CashflowItem::Mortgage {
+                                monthly: m, ..
+                            } = &mut mortgage.item
+                            {
+                                *m = monthly;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            Self::PayChange {
+                monthly,
+                annualized_rate,
+                id,
+            } => {
+                let idx = match id.as_deref() {
+                    Some(target) => s
+                        .cashflow
+                        .iter()
+                        .position(|l| l.id.as_deref() == Some(target)),
+                    None => s.cashflow.iter().position(|l| {
+                        matches!(l.item, CashflowItem::Salary { .. })
+                    }),
+                };
+                if let Some(idx) = idx {
+                    if let CashflowItem::Salary {
+                        monthly: m,
+                        annualized_rate: r,
+                    } = &mut s.cashflow[idx].item
+                    {
+                        *m = monthly;
+                        *r = annualized_rate;
+                    }
+                }
+            }
         }
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct Event {
     when: u16,
     #[serde(flatten)]
@@ -391,6 +587,17 @@ struct Scenario {
     salary_accrued: f64,
     mpf_accrued: f64,
     rent_accrued: f64,
+    // Allowance override derived from a non-trivial `tax:` block; None
+    // falls back to BASIC_ALLOWANCE.
+    allowance_override: Option<f64>,
+    // Cash floor from the optional `saving:` field; tracked when present.
+    saving_target: Option<f64>,
+    // First month (0-indexed) cash dropped below `saving`; None when on
+    // target for the entire run. Minimum cash seen during the run.
+    saving_breach_month: Option<u16>,
+    min_cash: f64,
+    // Total months to run: 360 default, or `end - start + 1` when both set.
+    horizon: u16,
 }
 
 impl Scenario {
@@ -441,11 +648,20 @@ impl Scenario {
         if self.at % 12 == 11 {
             // Charged before settlement so the bill participates in reserve
             // restoration like any other expense.
-            self.cash -= salaries_tax(self.salary_accrued, self.mpf_accrued, BASIC_ALLOWANCE)
+            let allowance = self.allowance_override.unwrap_or(BASIC_ALLOWANCE);
+            self.cash -= salaries_tax(self.salary_accrued, self.mpf_accrued, allowance)
                 + property_tax(self.rent_accrued);
             self.salary_accrued = 0.0;
             self.mpf_accrued = 0.0;
             self.rent_accrued = 0.0;
+        }
+        if self.cash < self.min_cash {
+            self.min_cash = self.cash;
+        }
+        if let Some(target) = self.saving_target {
+            if self.cash < target && self.saving_breach_month.is_none() {
+                self.saving_breach_month = Some(self.at);
+            }
         }
         self.settle(expense_base);
         let assets_value = self.assets.iter().map(|a| a.value()).sum();
@@ -529,17 +745,48 @@ impl Scenario {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct ScenarioInput {
     cash: f64,
     #[serde(default)]
     reserve_months: u32,
+    #[serde(default)]
+    tax: Option<TaxConfig>,
+    #[serde(default)]
+    start: Option<String>,
+    #[serde(default)]
+    end: Option<String>,
+    #[serde(default)]
+    saving: Option<f64>,
     events: Vec<Event>,
 }
 
 impl ScenarioInput {
-    fn into_scenario(self) -> Scenario {
-        Scenario {
+    fn horizon(&self) -> Result<u16, String> {
+        match (&self.start, &self.end) {
+            (Some(s), Some(e)) => {
+                let s_ym = parse_ym(s).map_err(|m| format!("start: {m}"))?;
+                let e_ym = parse_ym(e).map_err(|m| format!("end: {m}"))?;
+                let months = months_between(s_ym, e_ym)? + 1;
+                u16::try_from(months).map_err(|_| format!("horizon {months} exceeds u16"))
+            }
+            (None, None) => Ok(360),
+            _ => Err("start and end must both be present or both absent".to_string()),
+        }
+    }
+    fn into_scenario(self) -> Result<Scenario, String> {
+        if let Some(s) = self.saving {
+            if s < 0.0 {
+                return Err(format!("saving must be non-negative, got {s}"));
+            }
+        }
+        let allowance_override = self
+            .tax
+            .as_ref()
+            .filter(|t| t.is_non_trivial())
+            .map(|t| t.annual_basic());
+        let horizon = self.horizon()?;
+        Ok(Scenario {
             at: 0,
             cash: self.cash,
             cashflow: Vec::new(),
@@ -549,7 +796,12 @@ impl ScenarioInput {
             salary_accrued: 0.0,
             mpf_accrued: 0.0,
             rent_accrued: 0.0,
-        }
+            allowance_override,
+            saving_target: self.saving,
+            saving_breach_month: None,
+            min_cash: self.cash,
+            horizon,
+        })
     }
 }
 
@@ -557,7 +809,7 @@ fn load(path: &std::path::Path) -> Result<Scenario, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let input: ScenarioInput =
         serde_yaml_ng::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(input.into_scenario())
+    input.into_scenario()
 }
 
 /// Parse CLI args: first non-flag is the path (default `scenario.yaml`),
@@ -637,15 +889,20 @@ fn key_stats(stats: &[Stats]) -> KeyStats {
 }
 
 /// Format the non-terminal human summary byte-for-byte the way `main` always
-/// has: the final-month line, then the insolvent line when one exists.
-fn format_text_summary(stats: &[Stats]) -> String {
+/// has: the final-month line, then the insolvent line when one exists,
+/// then the saving-target breach line when one is configured.
+fn format_text_summary(stats: &[Stats], saving_breach: Option<u16>) -> String {
     let last = stats.last().unwrap();
+    let months = stats.len().saturating_sub(1);
     let mut out = format!(
-        "after 360 months: cash {:.2}, assets {:.2}, monthly cashflow {:.2}\n",
+        "after {months} months: cash {:.2}, assets {:.2}, monthly cashflow {:.2}\n",
         last.cash, last.assets_value, last.monthly_cashflow
     );
     if let Some((month, _)) = stats.iter().enumerate().find(|(_, s)| s.cash < 0.0) {
         out.push_str(&format!("insolvent from month {month}\n"));
+    }
+    if let Some(month) = saving_breach {
+        out.push_str(&format!("saving target breached at month {month}\n"));
     }
     out
 }
@@ -666,7 +923,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let stats = scenario.run(360);
+    let horizon = scenario.horizon;
+    let stats = scenario.run(horizon);
     if json {
         println!("{}", stats_json(&stats));
         return;
@@ -678,7 +936,7 @@ fn main() {
         }
         return;
     }
-    print!("{}", format_text_summary(&stats));
+    print!("{}", format_text_summary(&stats, scenario.saving_breach_month));
 }
 
 #[cfg(test)]
@@ -696,7 +954,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(0);
         assert_eq!(stats[0].cash, 20000.0); // 50000 - 1000*30
         assert_eq!(stats[0].monthly_cashflow, 0.0); // one-time cost, not a flow
@@ -714,7 +972,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(0);
         assert_eq!(stats[0].cash, 15000.0);
         assert_eq!(stats[0].assets_value, 5000.0); // principal starts intact
@@ -731,7 +989,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(2);
         assert_eq!(stats[0].cash, 19900.0); // 50000 - 30000 price - 100 mortgage
         assert_eq!(stats[1].cash - stats[0].cash, -100.0);
@@ -749,7 +1007,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(3);
         assert_eq!(stats[1].monthly_cashflow, 13300.0); // net of MPF
         assert_eq!(stats[2].monthly_cashflow, 7600.0);
@@ -767,7 +1025,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(2);
         assert_eq!(stats[1].monthly_cashflow, 5700.0);
         assert_eq!(stats[2].monthly_cashflow, 5700.0);
@@ -784,7 +1042,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(2);
         assert_eq!(stats[0].monthly_cashflow, -1000.0);
         assert_eq!(stats[1].monthly_cashflow, -400.0);
@@ -801,7 +1059,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(2);
         assert_eq!(stats[1].cash, 15300.0); // no-op: both months paid, net of MPF
         assert_eq!(stats[2].monthly_cashflow, 7600.0);
@@ -818,7 +1076,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         s.once();
         assert_eq!(s.cashflow.len(), 1);
         assert!(matches!(s.cashflow[0].item, CashflowItem::Tuition { .. }));
@@ -857,6 +1115,11 @@ events:
             salary_accrued: 0.0,
             mpf_accrued: 0.0,
             rent_accrued: 0.0,
+            allowance_override: None,
+            saving_target: None,
+            saving_breach_month: None,
+            min_cash: 0.0,
+            horizon: 12,
         };
         let stats = s.run(12);
         assert_eq!(stats.len(), 13);
@@ -870,7 +1133,7 @@ events:
         let yaml = "cash: 0\nevents:\n  - when: 0\n    type: job\n    id: partner\n    salary: { monthly: 6000, annualized_rate: 0.0 }";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         s.once();
         assert_eq!(s.cashflow.len(), 1);
         assert_eq!(s.cashflow[0].id.as_deref(), Some("partner"));
@@ -887,7 +1150,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(4);
         assert_eq!(stats[1].monthly_cashflow, 13300.0); // net of MPF
         assert_eq!(stats[2].monthly_cashflow, 7600.0);
@@ -906,7 +1169,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(3);
         assert_eq!(stats[1].monthly_cashflow, -500.0);
         assert_eq!(stats[2].monthly_cashflow, 0.0);
@@ -919,7 +1182,7 @@ events:
         let yaml = "cash: 100\nevents:\n  - { when: 1, type: end, id: ghost }\n";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(3);
         assert_eq!(stats[3].cash, 100.0);
         assert_eq!(stats[3].monthly_cashflow, 0.0);
@@ -930,7 +1193,7 @@ events:
         let yaml = "cash: 20000\nevents:\n  - { when: 3, type: one_off_expense, one_off: { amount: 5000 } }\n";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(5);
         assert_eq!(stats[2].monthly_cashflow, 0.0);
         assert_eq!(stats[3].monthly_cashflow, -5000.0);
@@ -944,7 +1207,7 @@ events:
         let yaml = "cash: 0\nevents:\n  - { when: 0, type: one_off_expense, one_off: { amount: 100 } }\n";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(1);
         assert_eq!(stats[0].monthly_cashflow, -100.0);
         assert_eq!(stats[1].monthly_cashflow, 0.0);
@@ -955,7 +1218,7 @@ events:
         let yaml = "cash: 0\nevents:\n  - { when: 6, type: one_off_income, one_off: { amount: 10000 } }\n";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(8);
         assert_eq!(stats[5].monthly_cashflow, 0.0);
         assert_eq!(stats[6].monthly_cashflow, 10000.0);
@@ -968,7 +1231,7 @@ events:
         let yaml = "cash: 0\nevents:\n  - { when: 0, type: one_off_expense, one_off: { amount: -5000 } }\n  - { when: 0, type: one_off_income, one_off: { amount: -1000 } }\n";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(0);
         assert_eq!(stats[0].monthly_cashflow, -4000.0);
     }
@@ -978,7 +1241,7 @@ events:
         let yaml = "cash: 20000\nevents:\n  - { when: 0, type: one_off_expense, id: tax, one_off: { amount: 5000 } }\n  - { when: 0, type: end, id: tax }\n";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(1);
         assert_eq!(stats[0].monthly_cashflow, 0.0);
         assert_eq!(stats[1].cash, 20000.0);
@@ -993,7 +1256,7 @@ events:
     #[test]
     fn minimal_scenario_loads() {
         let input: ScenarioInput = serde_yaml_ng::from_str("cash: 20000\nevents: []").unwrap();
-        let s = input.into_scenario();
+        let s = input.into_scenario().unwrap();
         assert_eq!(s.cash, 20000.0);
         assert!(s.cashflow.is_empty());
         assert!(s.assets.is_empty());
@@ -1033,7 +1296,7 @@ events:
 "#;
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(24);
         assert_eq!(stats.len(), 25);
         // salary fired then was removed by layoff; rent remains
@@ -1054,7 +1317,7 @@ events:
         let yaml = "cash: 0\nevents:\n  - when: 0\n    type: buy_home\n    property: { sqft: 1000, price_per_sqft: 100, capex_per_sqft: 10, annualized_rate: 0.0, mortgage: { mortgage: { monthly: 1000, period: 12 } } }";
         let s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         match &s.events[0].kind {
             EventType::BuyHome(Asset::Property {
                 mortgage:
@@ -1076,7 +1339,7 @@ events:
         let yaml = "cash: 10000\nreserve_months: 3\nevents: []\n";
         let s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         assert_eq!(s.reserve_months, 3);
     }
 
@@ -1102,7 +1365,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(0);
         assert_eq!(stats[0].cash, 48000.0); // rent paid but no liquidation
         assert!(s.assets.is_empty());
@@ -1123,7 +1386,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(0);
         assert_eq!(stats[0].cash, -1150.0); // 50 - 1000 fund - 200 rent; no settlement
         match &s.assets[0] {
@@ -1150,7 +1413,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(0);
         assert_eq!(stats[0].cash, -50.0);
         assert!(s.assets.is_empty());
@@ -1182,7 +1445,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(1);
         assert_eq!(stats[0].cash, 28800.0);
         assert!(s.assets.is_empty());
@@ -1212,7 +1475,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(0);
         assert_eq!(stats[0].cash, 6000.0);
         assert_eq!(stats[0].monthly_cashflow, -7000.0); // rent -2000 + one-off -5000
@@ -1241,7 +1504,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(0);
         assert_eq!(stats[0].cash, 600.0);
         assert_eq!(stats[0].monthly_cashflow, -200.0);
@@ -1325,7 +1588,7 @@ events:
     fn scenario(yaml: &str) -> Scenario {
         serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario()
+            .into_scenario().unwrap()
     }
 
     #[test]
@@ -1549,20 +1812,20 @@ events:
     fn format_text_summary_pipes_byte_for_byte() {
         // The non-terminal text path must reproduce the pre-TUI summary byte-for-byte.
         let stats = vec![s(100.0, 50.0, 25.0), s(75.0, 60.0, -25.0)];
-        let out = format_text_summary(&stats);
+        let out = format_text_summary(&stats, None);
         assert_eq!(
             out,
-            "after 360 months: cash 75.00, assets 60.00, monthly cashflow -25.00\n"
+            "after 1 months: cash 75.00, assets 60.00, monthly cashflow -25.00\n"
         );
     }
 
     #[test]
     fn format_text_summary_appends_insolvent_line() {
         let stats = vec![s(100.0, 0.0, 0.0), s(-1.0, 0.0, 0.0), s(50.0, 0.0, 0.0)];
-        let out = format_text_summary(&stats);
+        let out = format_text_summary(&stats, None);
         assert_eq!(
             out,
-            "after 360 months: cash 50.00, assets 0.00, monthly cashflow 0.00\n\
+            "after 2 months: cash 50.00, assets 0.00, monthly cashflow 0.00\n\
              insolvent from month 1\n"
         );
     }
@@ -1570,10 +1833,10 @@ events:
     #[test]
     fn format_text_summary_omits_insolvent_line_when_solvent() {
         let stats = vec![s(100.0, 0.0, 0.0), s(50.0, 0.0, 0.0), s(0.5, 0.0, 0.0)];
-        let out = format_text_summary(&stats);
+        let out = format_text_summary(&stats, None);
         assert_eq!(
             out,
-            "after 360 months: cash 0.50, assets 0.00, monthly cashflow 0.00\n"
+            "after 2 months: cash 0.50, assets 0.00, monthly cashflow 0.00\n"
         );
     }
 
@@ -1589,7 +1852,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(12);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&stats_json(&stats)).unwrap();
         assert_eq!(parsed.len(), 13);
@@ -1611,7 +1874,7 @@ events:
 ";
         let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
             .unwrap()
-            .into_scenario();
+            .into_scenario().unwrap();
         let stats = s.run(12);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&stats_json(&stats)).unwrap();
         let last = parsed.last().unwrap();
@@ -1624,4 +1887,393 @@ events:
         );
     }
 
+    // ---- TaxConfig::annual_basic (IRD 2026/27 household allowances) ----
+
+    fn yaml_to_tax(yaml: &str) -> TaxConfig {
+        serde_yaml_ng::from_str::<TaxConfig>(yaml).unwrap()
+    }
+
+    #[test]
+    fn annual_basic_married_two_kids_two_noncohabiting_parents_60_plus() {
+        // 290k married + 2*140k children + 2*55k parents = 680,000
+        let t = yaml_to_tax(
+            "status: married
+children: 2
+parents:
+  - age_band: '60+'
+    living_with: false
+  - age_band: '60+'
+    living_with: false",
+        );
+        assert_eq!(t.annual_basic(), 680_000.0);
+    }
+
+    #[test]
+    fn annual_basic_single_one_cohabiting_parent_55_to_59() {
+        // 145k single + 55k parent (27.5k doubled to 55k because living_with) = 200,000
+        let t = yaml_to_tax(
+            "status: single
+parents:
+  - age_band: '55-59'
+    living_with: true",
+        );
+        assert_eq!(t.annual_basic(), 200_000.0);
+    }
+
+    #[test]
+    fn annual_basic_empty_block_is_not_non_trivial() {
+        let t = yaml_to_tax("{}");
+        assert!(!t.is_non_trivial());
+        assert_eq!(t.annual_basic(), SINGLE_BASIC);
+    }
+
+    #[test]
+    fn annual_basic_unknown_field_fails_to_load() {
+        let err = serde_yaml_ng::from_str::<TaxConfig>("shoe_size: 42")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("shoe_size"), "error should name the field: {err}");
+    }
+
+    #[test]
+    fn annual_basic_parent_missing_age_band_fails_to_load() {
+        let err = serde_yaml_ng::from_str::<TaxConfig>("parents: [{ living_with: false }]")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("age_band"), "error: {err}");
+    }
+
+    #[test]
+    fn married_tax_block_pays_tax_against_derived_total() {
+        // Tax against 680k allowance yields less than against 132k default.
+        // 240k * 12mo gross = 2,880,000. MPF 18,000. Chargeable against
+        // 680k allowance = 2,182,000 -> progressive 320,540 vs standard
+        // 431,700 -> min = 320,540. Against 132k default = 2,730,000 ->
+        // progressive 432,100 vs standard 431,700 -> min = 431,700. Diff =
+        // 111,160.
+        let mut s = scenario(
+            "cash: 0
+tax:
+  status: married
+  children: 2
+  parents:
+    - age_band: '60+'
+      living_with: false
+    - age_band: '60+'
+      living_with: false
+events:
+  - { when: 0, type: job, salary: { monthly: 240000, annualized_rate: 0.0 } }",
+        );
+        let stats = s.run(11);
+        // expected cash: 12 * (240000 - 1500) - salaries_tax(2_880_000, 18_000, 680_000) - 0
+        let net = (240_000.0 - 1_500.0) * 12.0;
+        let tax = salaries_tax(2_880_000.0, 18_000.0, 680_000.0);
+        assert!((stats[11].cash - (net - tax)).abs() < 0.01, "got {}, expected {}", stats[11].cash, net - tax);
+    }
+
+    // ---- Date parsing ----
+
+    #[test]
+    fn parse_ym_accepts_valid() {
+        assert_eq!(parse_ym("2026-08").unwrap(), (2026, 8));
+    }
+
+    #[test]
+    fn parse_ym_rejects_garbage() {
+        assert!(parse_ym("nope").is_err());
+        assert!(parse_ym("2026/08").is_err());
+        assert!(parse_ym("2026-13").is_err());
+        assert!(parse_ym("2026-00").is_err());
+    }
+
+    #[test]
+    fn months_between_inclusive() {
+        let s = (2026, 8);
+        assert_eq!(months_between(s, (2026, 8)).unwrap(), 0); // same -> 0
+        assert_eq!(months_between(s, (2026, 9)).unwrap(), 1);
+        assert_eq!(months_between(s, (2029, 8)).unwrap(), 36);
+    }
+
+    #[test]
+    fn months_between_rejects_reversed() {
+        assert!(months_between((2026, 8), (2026, 7)).is_err());
+    }
+
+    // ---- Scenario: start / end / saving ----
+
+    #[test]
+    fn end_truncates_run_to_horizon() {
+        let yaml = "
+cash: 0
+start: 2026-08
+end: 2029-08
+events: []
+";
+        let s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario()
+            .unwrap();
+        assert_eq!(s.horizon, 37); // Aug 2026 to Aug 2029 inclusive = 37 months
+    }
+
+    #[test]
+    fn absent_end_uses_360_default() {
+        let s = scenario("cash: 0\nevents: []");
+        assert_eq!(s.horizon, 360);
+    }
+
+    #[test]
+    fn only_one_of_start_end_fails_to_load() {
+        assert!(serde_yaml_ng::from_str::<ScenarioInput>("cash: 0\nstart: 2026-08\nevents: []")
+            .unwrap()
+            .into_scenario()
+            .is_err());
+    }
+
+    #[test]
+    fn negative_saving_fails_to_load() {
+        assert!(serde_yaml_ng::from_str::<ScenarioInput>("cash: 0\nsaving: -1\nevents: []")
+            .unwrap()
+            .into_scenario()
+            .is_err());
+    }
+
+    #[test]
+    fn saving_breach_records_first_month() {
+        let mut s = scenario(
+            "cash: 100
+saving: 200
+events:
+  - { when: 0, type: expense, rent: { monthly: 50, annualized_rate: 0.0 } }",
+        );
+        s.run(2);
+        assert_eq!(s.saving_breach_month, Some(0));
+    }
+
+    #[test]
+    fn saving_unbreached_records_none() {
+        let mut s = scenario(
+            "cash: 10000
+saving: 100
+events:
+  - { when: 0, type: expense, rent: { monthly: 1, annualized_rate: 0.0 } }",
+        );
+        s.run(2);
+        assert_eq!(s.saving_breach_month, None);
+    }
+
+    #[test]
+    fn format_text_summary_appends_saving_breach_line() {
+        let stats = vec![s(100.0, 0.0, 0.0), s(50.0, 0.0, 0.0)];
+        let out = format_text_summary(&stats, Some(0));
+        assert!(out.contains("saving target breached at month 0\n"), "got: {out}");
+    }
+
+    // ---- Event: downturn ----
+
+    #[test]
+    fn downturn_drops_fund_and_property_in_one_month() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - when: 0
+    type: investment
+    fund: { principal: 1000000, annualized_rate: 0.0 }
+  - when: 0
+    type: buy_home
+    property: { sqft: 100, price_per_sqft: 30000, capex_per_sqft: 0, annualized_rate: 0.0, mortgage: { mortgage: { monthly: 0, period: 1 } } }
+  - when: 0
+    type: downturn
+    equity_drop: 0.5
+    property_drop: 0.5",
+        );
+        let stats = s.run(0);
+        match &s.assets[0] {
+            Asset::Fund { principal, .. } => assert_eq!(*principal, 500_000.0),
+            _ => panic!("expected fund"),
+        }
+        match &s.assets[1] {
+            Asset::Property { price_per_sqft, .. } => assert_eq!(*price_per_sqft, 15_000.0),
+            _ => panic!("expected property"),
+        }
+        // monthly_cashflow unchanged: downturn is a balance-sheet move.
+        assert_eq!(stats[0].monthly_cashflow, 0.0);
+    }
+
+    #[test]
+    fn downturn_only_equity_leaves_property_untouched() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - when: 0
+    type: investment
+    fund: { principal: 1000, annualized_rate: 0.0 }
+  - when: 0
+    type: buy_home
+    property: { sqft: 100, price_per_sqft: 30000, capex_per_sqft: 0, annualized_rate: 0.0, mortgage: { mortgage: { monthly: 0, period: 1 } } }
+  - when: 0
+    type: downturn
+    equity_drop: 0.22
+    property_drop: 0.0",
+        );
+        s.run(0);
+        match &s.assets[0] {
+            Asset::Fund { principal, .. } => assert_eq!(*principal, 780.0),
+            _ => panic!("expected fund"),
+        }
+        match &s.assets[1] {
+            Asset::Property { price_per_sqft, .. } => assert_eq!(*price_per_sqft, 30_000.0),
+            _ => panic!("expected property"),
+        }
+    }
+
+    #[test]
+    fn downturn_does_not_refire() {
+        // One downturn at month 0 with drop 0.5; running the loaded
+        // scenario for 5 months must not re-apply the drop on later months.
+        let mut s = scenario(
+            "cash: 0
+events:
+  - when: 0
+    type: investment
+    fund: { principal: 1000, annualized_rate: 0.0 }
+  - when: 0
+    type: downturn
+    equity_drop: 0.5",
+        );
+        let stats = s.run(5);
+        match &s.assets[0] {
+            Asset::Fund { principal, .. } => assert_eq!(*principal, 500.0),
+            _ => panic!("expected fund"),
+        }
+        // After the drop, monthly_cashflow stays at zero (no flow).
+        assert!(stats[1].monthly_cashflow.abs() < 0.01);
+        assert!(stats[5].monthly_cashflow.abs() < 0.01);
+    }
+
+    // ---- Event: refinance ----
+
+    #[test]
+    fn refinance_updates_mortgage_monthly() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - when: 0
+    type: buy_home
+    property: { sqft: 100, price_per_sqft: 100, capex_per_sqft: 0, annualized_rate: 0.0, mortgage: { id: home-loan, mortgage: { monthly: 1000, period: 240 } } }
+  - when: 0
+    type: refinance
+    id: home-loan
+    monthly: 2000",
+        );
+        s.run(1);
+        match &s.assets[0] {
+            Asset::Property { mortgage, .. } => match &mortgage.item {
+                CashflowItem::Mortgage { monthly, period, .. } => {
+                    assert_eq!(*monthly, 2000.0);
+                    assert_eq!(*period as u16, 240);
+                }
+                _ => panic!("expected mortgage"),
+            },
+            _ => panic!("expected property"),
+        }
+    }
+
+    #[test]
+    fn refinance_unknown_id_is_noop() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - when: 0
+    type: buy_home
+    property: { sqft: 100, price_per_sqft: 100, capex_per_sqft: 0, annualized_rate: 0.0, mortgage: { id: home-loan, mortgage: { monthly: 1000, period: 240 } } }
+  - when: 0
+    type: refinance
+    id: ghost
+    monthly: 9999",
+        );
+        s.run(0);
+        match &s.assets[0] {
+            Asset::Property { mortgage, .. } => match &mortgage.item {
+                CashflowItem::Mortgage { monthly, .. } => assert_eq!(*monthly, 1000.0),
+                _ => panic!("expected mortgage"),
+            },
+            _ => panic!("expected property"),
+        }
+    }
+
+    #[test]
+    fn refinance_without_id_fails_to_load() {
+        let yaml = "cash: 0\nevents:\n  - { when: 0, type: refinance, monthly: 1000 }\n";
+        let err = serde_yaml_ng::from_str::<ScenarioInput>(yaml).unwrap_err().to_string();
+        assert!(err.contains("id"), "error should mention id: {err}");
+    }
+
+    // ---- Event: downturn rent_drop ----
+
+    #[test]
+    fn downturn_rent_drop_lowers_rental_income() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - when: 0
+    type: buy_to_let
+    property: { sqft: 100, price_per_sqft: 100, capex_per_sqft: 0, annualized_rate: 0.0, mortgage: { mortgage: { monthly: 0, period: 1 } }, rental: { rental_income: { occupancy: 1.0, monthly: 30000, annualized_rate: 0.0 } } }
+  - when: 0
+    type: downturn
+    equity_drop: 0.0
+    property_drop: 0.0
+    rent_drop: 0.10",
+        );
+        s.run(0);
+        match &s.assets[0] {
+            Asset::Property { rental: Some(r), .. } => match &r.item {
+                CashflowItem::RentalIncome { monthly, .. } => assert_eq!(*monthly, 27_000.0),
+                _ => panic!("expected rental income"),
+            },
+            _ => panic!("expected property with rental"),
+        }
+    }
+
+    // ---- Event: pay_change ----
+
+    #[test]
+    fn pay_change_updates_first_salary_when_no_id() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: job, salary: { monthly: 100000, annualized_rate: 0.03 } }
+  - { when: 0, type: job, salary: { monthly: 50000, annualized_rate: 0.03 } }
+  - { when: 6, type: pay_change, monthly: 200000, annualized_rate: 0.0 }",
+        );
+        s.run(7);
+        match &s.cashflow[0].item {
+            CashflowItem::Salary { monthly, annualized_rate } => {
+                assert!(*monthly > 100_000.0 && *monthly <= 200_000.0,
+                    "monthly {monthly} should be at or below the new 200k after some compounding");
+                assert_eq!(*annualized_rate, 0.0);
+            }
+            _ => panic!("expected salary"),
+        }
+    }
+
+    #[test]
+    fn pay_change_with_id_targets_labeled_salary() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: job, id: me, salary: { monthly: 100000, annualized_rate: 0.03 } }
+  - { when: 0, type: job, id: partner, salary: { monthly: 50000, annualized_rate: 0.03 } }
+  - { when: 6, type: pay_change, id: partner, monthly: 80000, annualized_rate: 0.0 }",
+        );
+        s.run(7);
+        for c in &s.cashflow {
+            if c.id.as_deref() == Some("partner") {
+                if let CashflowItem::Salary { monthly, annualized_rate } = &c.item {
+                    assert!(*monthly > 50_000.0 && *monthly <= 80_000.0);
+                    assert_eq!(*annualized_rate, 0.0);
+                }
+            }
+        }
+    }
 }
