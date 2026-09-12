@@ -209,6 +209,13 @@ enum CashflowItem {
         monthly: f64,
         annualized_rate: f64,
     },
+    /// Post-retirement recurring drawdown expense. Math identical to `Rent`
+    /// (monthly grows at `^(1/12)`, contributes to `expense_base`, no MPF /
+    /// tax accrual — pension models taxable retirement income separately).
+    Withdrawal {
+        monthly: f64,
+        annualized_rate: f64,
+    },
     OneOff {
         amount: f64,
         #[serde(default)]
@@ -281,6 +288,14 @@ impl CashflowItem {
                 let m = *monthly;
                 *monthly *= (1.0 + *annualized_rate).powf(1.0 / 12.0);
                 (Cashflow::Income(m), 0.0)
+            }
+            Self::Withdrawal {
+                monthly,
+                annualized_rate,
+            } => {
+                let m = *monthly;
+                *monthly *= (1.0 + *annualized_rate).powf(1.0 / 12.0);
+                (Cashflow::Expense(m), m.abs())
             }
             Self::OneOff { amount, fired } => {
                 if *fired {
@@ -422,6 +437,7 @@ enum EventType {
     OneOffExpense(Labeled),
     OneOffIncome(Labeled),
     Pension(Labeled),
+    Withdrawal(Labeled),
     End { id: String },
     /// One-shot percentage drop to funds and/or properties in the firing
     /// month. No cashflow; the post-drop base resumes monthly growth.
@@ -480,6 +496,7 @@ impl EventType {
                 s.cashflow.push(i);
             }
             Self::Pension(i) => s.cashflow.push(i),
+            Self::Withdrawal(i) => s.cashflow.push(i),
 
             Self::Graduate { id } => s.remove_cashflow(
                 id.as_deref(),
@@ -3125,5 +3142,151 @@ events:
             panic!("expected load to fail")
         };
         assert!(err.contains("ender_pension_no_body.yaml"), "error: {err}");
+    }
+
+    // ---- Event: withdrawal (decumulation) ----
+
+    #[test]
+    fn withdrawal_event_adds_cashflow() {
+        let yaml = "
+cash: 0
+events:
+  - when: 0
+    type: withdrawal
+    withdrawal: { monthly: 30000, annualized_rate: 0.025 }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario()
+            .unwrap();
+        s.once();
+        assert_eq!(s.cashflow.len(), 1);
+        match &s.cashflow[0].item {
+            CashflowItem::Withdrawal { monthly, annualized_rate } => {
+                assert!(*monthly > 30000.0, "withdrawal should have grown: got {monthly}");
+                assert_eq!(*annualized_rate, 0.025);
+            }
+            _ => panic!("expected withdrawal"),
+        }
+    }
+
+    #[test]
+    fn withdrawal_grows_like_rent() {
+        let mut sr = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: expense, rent: { monthly: 30000, annualized_rate: 0.025 } }",
+        );
+        sr.run(2);
+        let rent_m2 = match &sr.cashflow[0].item {
+            CashflowItem::Rent { monthly, .. } => *monthly,
+            _ => panic!("expected rent"),
+        };
+
+        let mut sw = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: withdrawal, withdrawal: { monthly: 30000, annualized_rate: 0.025 } }",
+        );
+        sw.run(2);
+        let wd_m2 = match &sw.cashflow[0].item {
+            CashflowItem::Withdrawal { monthly, .. } => *monthly,
+            _ => panic!("expected withdrawal"),
+        };
+
+        assert!((rent_m2 - wd_m2).abs() < 1e-9,
+            "rent month-2 {rent_m2} != withdrawal month-2 {wd_m2}");
+    }
+
+    #[test]
+    fn withdrawal_is_net_no_mpf() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: withdrawal, withdrawal: { monthly: 20000, annualized_rate: 0.0 } }",
+        );
+        let stats = s.run(1);
+        assert_eq!(stats[0].monthly_cashflow, -20_000.0);
+        assert_eq!(stats[1].monthly_cashflow, -20_000.0);
+    }
+
+    #[test]
+    fn end_removes_withdrawal_by_id() {
+        let yaml = "
+cash: 0
+events:
+  - { when: 0, type: withdrawal, id: spend, withdrawal: { monthly: 10000, annualized_rate: 0.0 } }
+  - { when: 5, type: end, id: spend }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario()
+            .unwrap();
+        let stats = s.run(7);
+        assert_eq!(stats[4].monthly_cashflow, -10_000.0);
+        assert_eq!(stats[5].monthly_cashflow, 0.0);
+        assert_eq!(stats[6].monthly_cashflow, 0.0);
+        assert_eq!(stats[7].monthly_cashflow, 0.0);
+    }
+
+    #[test]
+    fn withdrawal_in_reserve_base() {
+        // reserve 6, rent 10000 + withdrawal 30000 -> target 6 * 40000 = 240000.
+        // cash 280000 + fund 100000: post-events cash = 180000, post-flows
+        // = 140000, shortfall = 100000 -> fund drawn to 0, cash lands at the
+        // 240000 target. If withdrawal were not in the base, target would be
+        // 60000 and no draw would occur (cash would end at 140000).
+        let yaml = "
+cash: 280000
+reserve_months: 6
+events:
+  - { when: 0, type: expense, rent: { monthly: 10000, annualized_rate: 0.0 } }
+  - { when: 0, type: withdrawal, withdrawal: { monthly: 30000, annualized_rate: 0.0 } }
+  - { when: 0, type: investment, fund: { principal: 100000, annualized_rate: 0.0 } }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario()
+            .unwrap();
+        let stats = s.run(0);
+        assert_eq!(stats[0].cash, 240_000.0);
+        assert!(s.assets.is_empty(), "fund should be drawn to zero and removed");
+    }
+
+    #[test]
+    fn withdrawal_triggers_asset_drawdown() {
+        // cash 1_000_000, fund 1_000_000 bought month 0 (cost deducted from
+        // cash -> 0), then withdrawal 30000 fires immediately. target =
+        // 12 * 30000 = 360000; shortfall 390000; fund drawn to 610_000;
+        // cash lands at 360_000.
+        let yaml = "
+cash: 1000000
+reserve_months: 12
+events:
+  - { when: 0, type: investment, fund: { principal: 1000000, annualized_rate: 0.0 } }
+  - { when: 0, type: withdrawal, withdrawal: { monthly: 30000, annualized_rate: 0.0 } }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario()
+            .unwrap();
+        let stats = s.run(0);
+        assert_eq!(stats[0].cash, 360_000.0);
+        match &s.assets[0] {
+            Asset::Fund { principal, .. } => assert_eq!(*principal, 610_000.0),
+            _ => panic!("expected fund"),
+        }
+    }
+
+    #[test]
+    fn withdrawal_without_body_fails_to_load() {
+        let path = write_tmp(
+            "ender_withdrawal_no_body.yaml",
+            "cash: 0\nevents:\n  - { when: 0, type: withdrawal }\n",
+        );
+        let Err(err) = load(&path) else {
+            panic!("expected load to fail")
+        };
+        assert!(err.contains("ender_withdrawal_no_body.yaml"), "error: {err}");
     }
 }

@@ -5,14 +5,14 @@
 Load a scenario (starting cash + events) from a YAML file into a runnable `Scenario`, with defined error reporting for invalid files.
 ## Requirements
 ### Requirement: Scenario is defined in a YAML file
-The system SHALL load a scenario from a YAML file containing starting `cash` and a list of `events`, where each event has a `when` (month index, 0-based) and a `type` discriminator. Supported event types SHALL include `job`, `pension`, `expense`, `tuition`, `layoff`, `graduate`, `buy_home`, `buy_to_let`, `investment`, `end`, `one_off_expense`, `one_off_income`, and `death`.
+The system SHALL load a scenario from a YAML file containing starting `cash` and a list of `events`, where each event has a `when` (month index, 0-based) and a `type` discriminator. Supported event types SHALL include `job`, `pension`, `expense`, `tuition`, `withdrawal`, `layoff`, `graduate`, `buy_home`, `buy_to_let`, `investment`, `end`, `one_off_expense`, `one_off_income`, and `death`.
 
 #### Scenario: Minimal scenario
 - **WHEN** a YAML file contains `cash: 20000` and an empty `events` list
 - **THEN** loading it yields a `Scenario` with 20000.0 cash, no cashflows, no assets, and no events
 
 #### Scenario: Full event vocabulary
-- **WHEN** a YAML file uses each event type — `job`, `pension`, `expense`, `tuition`, `buy_home`, `buy_to_let`, `investment`, `end`, `one_off_expense`, `one_off_income`, `death` — with their required fields
+- **WHEN** a YAML file uses each event type — `job`, `pension`, `expense`, `tuition`, `withdrawal`, `buy_home`, `buy_to_let`, `investment`, `end`, `one_off_expense`, `one_off_income`, `death` — with their required fields
 - **THEN** loading it yields a `Scenario` whose cashflow and asset lists contain the corresponding items, and whose event list contains the `end` and `death` events
 
 ### Requirement: Pension event adds a non-MPF income cashflow

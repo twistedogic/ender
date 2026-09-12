@@ -54,6 +54,7 @@ Events: `- when: <month from 0>`, `type:`, plus fields. Types:
 | `job` | `salary: {monthly, annualized_rate}` | income, net of MPF (5%, cap 1500/mo) |
 | `pension` | `pension: {monthly, annualized_rate}` | income, no MPF, assessable for salaries tax |
 | `expense` | `rent:` or `tuition:` map | recurring cost (identical math, label differs) |
+| `withdrawal` | `withdrawal:` map (monthly + annualized_rate) | post-retirement drawdown expense, funds itself via the reserve when cash is short |
 | `layoff` | `id:` | removes that salary |
 | `graduate` | `id:` | removes that tuition |
 | `end` | `id:` | removes any cashflow / rental / mortgage / investment by id |
@@ -142,6 +143,45 @@ The `end` stops the salary; the `pension` then carries the next block
 (12 × 15k = 180k gross against the allowance, no MPF). `annualized_rate`
 is model-agnostic — use 2.5–3% for HK civil-service CPI indexation,
 whatever fits the scheme you are modelling.
+
+## Decumulation / portfolio withdrawal
+
+`withdrawal` is the recurring drawdown cashflow for the post-retirement
+spending plan. It is mathematically identical to `rent` (monthly grows
+at `^(1/12)`, contributes to the reserve target) and is **funded by
+the existing reserve machinery** — when the month's cash cannot cover
+both the withdrawal and the `reserve_months × expense_base` floor, the
+simulator draws fund principals first, then sells properties in asset
+order. There is no separate drawdown pipeline. No MPF, no salaries /
+property tax accrual (taxable retirement income lives in `pension`).
+
+The intent is to model the user's chosen retirement spend and let the
+reserve answer "does the portfolio survive?" without hand-authoring
+hundreds of one-off expenses:
+
+```yaml
+# scenarios/retire-withdrawal.yaml
+cash: 200000
+reserve_months: 12
+events:
+  - { when: 0,   type: job,        id: main-job, salary: { monthly: 60000, annualized_rate: 0.03 } }
+  - { when: 0,   type: expense,    id: rent,      rent: { monthly: 15000, annualized_rate: 0.02 } }
+  - { when: 360, type: end,        id: main-job }
+  - { when: 360, type: end,        id: rent }
+  - { when: 360, type: pension,    pension: { monthly: 10000, annualized_rate: 0.025 } }
+  - { when: 360, type: withdrawal, withdrawal: { monthly: 30000, annualized_rate: 0.025 } }
+```
+
+The `end` events stop the working-life cashflows; the `pension` and
+`withdrawal` then carry the next block. Pick `reserve_months` to match
+the buffer you want funded from assets (12 in the example = one year
+of total monthly spend as cash). To stop the withdrawal partway
+through retirement (downsizing, moving in with family), pair it with an
+`id` and use a later `end: {id: ...}`.
+
+For sequence-of-returns risk, drop a `downturn` event in the year of
+retirement. The skill's instruction is to model downturns explicitly,
+not to add a Monte Carlo layer.
 
 ## Risk management / insurance modeling
 
