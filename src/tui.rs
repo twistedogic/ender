@@ -17,15 +17,22 @@ use crate::{GoalOutcome, KeyStats, Stats};
 
 /// Launch the interactive TUI: enter alternate screen + raw mode, render
 /// key statistics over a scrollable per-month table, restore the terminal
-/// on every exit path before returning.
-pub fn run(stats: &[Stats], keys: &KeyStats, goals: &[GoalOutcome]) -> io::Result<()> {
+/// on every exit path before returning. `terminal_month` is `Some(N)` when a
+/// `death` event cut the run short at month `N`; the header grows by one
+/// line in that case.
+pub fn run(
+    stats: &[Stats],
+    keys: &KeyStats,
+    goals: &[GoalOutcome],
+    terminal_month: Option<u16>,
+) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, stats, keys, goals);
+    let result = run_loop(&mut terminal, stats, keys, goals, terminal_month);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -38,13 +45,14 @@ fn run_loop<B: Backend>(
     stats: &[Stats],
     keys: &KeyStats,
     goals: &[GoalOutcome],
+    terminal_month: Option<u16>,
 ) -> io::Result<()> {
     let mut state = TableState::default();
     state.select(Some(0));
 
     loop {
         let page = page_step(terminal.size()?.height);
-        terminal.draw(|f| ui(f, stats, keys, goals, &mut state))?;
+        terminal.draw(|f| ui(f, stats, keys, goals, &mut state, terminal_month))?;
         if let Event::Key(key) = event::read()? {
             // Auto-repeat fires both Press and Release in some terminals; only
             // act on the key-down edge so holding a key doesn't double-step.
@@ -79,9 +87,17 @@ fn page_step(height: u16) -> usize {
     height.saturating_sub(9).max(1) as usize
 }
 
-fn ui(f: &mut Frame, stats: &[Stats], keys: &KeyStats, goals: &[GoalOutcome], state: &mut TableState) {
+fn ui(
+    f: &mut Frame,
+    stats: &[Stats],
+    keys: &KeyStats,
+    goals: &[GoalOutcome],
+    state: &mut TableState,
+    terminal_month: Option<u16>,
+) {
     // 4 base header lines + 1 blank + 1 help line + one per goal.
-    let header_height = 7 + goals.len() as u16;
+    // +1 when a death event terminated the run early.
+    let header_height = 7 + goals.len() as u16 + u16::from(terminal_month.is_some());
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(header_height), Constraint::Min(0)])
@@ -114,6 +130,9 @@ fn ui(f: &mut Frame, stats: &[Stats], keys: &KeyStats, goals: &[GoalOutcome], st
                 g.name, g.value, g.evaluation_month, g.target
             ));
         }
+    }
+    if let Some(month) = terminal_month {
+        header_text.push_str(&format!("\nterminal: month {month} (death event)"));
     }
     header_text.push_str(
         "\n\nj/k or arrows scroll · PageUp/PageDown by screen · q/Esc quits",
@@ -188,7 +207,7 @@ mod tests {
         let mut state = TableState::default();
         state.select(Some(0));
         terminal
-            .draw(|f| ui(f, &stats, &keys, &[], &mut state))
+            .draw(|f| ui(f, &stats, &keys, &[], &mut state, None))
             .unwrap();
         let rendered = frame_to_string(&mut terminal);
         assert!(rendered.contains("Key statistics"), "rendered: {rendered}");
@@ -208,7 +227,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = TableState::default();
         terminal
-            .draw(|f| ui(f, &stats, &keys, &[], &mut state))
+            .draw(|f| ui(f, &stats, &keys, &[], &mut state, None))
             .unwrap();
         let rendered = frame_to_string(&mut terminal);
         assert!(rendered.contains("insolvent: month 1"), "rendered: {rendered}");
@@ -229,7 +248,7 @@ mod tests {
         let mut state = TableState::default();
         state.select(Some(12));
         terminal
-            .draw(|f| ui(f, &stats, &keys, &[], &mut state))
+            .draw(|f| ui(f, &stats, &keys, &[], &mut state, None))
             .unwrap();
         let rendered = frame_to_string(&mut terminal);
         // header row + every data row

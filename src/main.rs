@@ -426,6 +426,11 @@ enum EventType {
         #[serde(default)]
         id: Option<String>,
     },
+    /// Terminal marker for insurance / mortality modeling. No body; sets the
+    /// scenario's `terminated` flag at the firing month so the run exits
+    /// after the firing month's events and cashflows settle. Pair with a
+    /// `one_off_income` at the same `when` to land a payout on death.
+    Death {},
 }
 
 impl EventType {
@@ -558,6 +563,7 @@ impl EventType {
                     }
                 }
             }
+            Self::Death {} => s.terminated = true,
         }
     }
 }
@@ -634,6 +640,10 @@ struct Scenario {
     horizon: u16,
     // Goals declared on the scenario; evaluated post-run, see `evaluate_goals`.
     goals: Vec<Goal>,
+    // Set by `EventType::Death {}` at its firing month. The run exits at the
+    // top of the next iteration; the firing month's events and cashflows
+    // settle normally so any `one_off_income` paired with the death lands.
+    terminated: bool,
 }
 
 impl Scenario {
@@ -775,6 +785,9 @@ impl Scenario {
     fn run(&mut self, n: u16) -> Vec<Stats> {
         let mut stats = Vec::new();
         for _ in 0..=n {
+            if self.terminated {
+                break;
+            }
             stats.push(self.once())
         }
         stats
@@ -867,6 +880,7 @@ impl ScenarioInput {
             min_cash: self.cash,
             horizon,
             goals: self.goals,
+            terminated: false,
         })
     }
 }
@@ -940,13 +954,15 @@ fn evaluate_goals(
     outcomes
 }
 
-/// Serialize the run as a JSON wrapper object: `months` carries the
-/// per-month series (one object per simulated month with `month`, `cash`,
+/// Serialize the run as a JSON wrapper object. `months` carries the per-month
+/// series (one object per simulated month with `month`, `cash`,
 /// `assets_value`, `monthly_cashflow`), `goals` carries one entry per
 /// declared goal with `name`, `target`, `by_month`, `kind`, `met`, `value`.
-/// The wrapper shape is forward-compatible with `add-insurance-modeling`,
-/// which will add a `terminal` field here.
-fn stats_json(stats: &[Stats], goals: &[GoalOutcome]) -> String {
+/// `terminal` is `true` when a `death` event ended the run early, and
+/// `terminal_month` is the integer month index at which the run stopped;
+/// both fields are present and `terminal_month` is set only when `terminal`
+/// is `true`.
+fn stats_json(stats: &[Stats], goals: &[GoalOutcome], terminal_month: Option<u16>) -> String {
     #[derive(Serialize)]
     struct Row<'a> {
         month: usize,
@@ -955,11 +971,20 @@ fn stats_json(stats: &[Stats], goals: &[GoalOutcome]) -> String {
     }
     #[derive(Serialize)]
     struct Wrapper<'a> {
+        terminal: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        terminal_month: Option<u16>,
         months: Vec<Row<'a>>,
         goals: &'a [GoalOutcome],
     }
     let rows: Vec<Row> = stats.iter().enumerate().map(|(month, s)| Row { month, stats: s }).collect();
-    serde_json::to_string(&Wrapper { months: rows, goals }).expect("stats JSON never fails")
+    serde_json::to_string(&Wrapper {
+        terminal: terminal_month.is_some(),
+        terminal_month,
+        months: rows,
+        goals,
+    })
+    .expect("stats JSON never fails")
 }
 
 /// Derived run-level statistics shown by the TUI header. Insolvency uses the
@@ -1013,11 +1038,14 @@ fn key_stats(stats: &[Stats]) -> KeyStats {
 /// then the saving-target breach line when one is configured, then one line
 /// per declared goal (already ordered by `by_month` ascending by the
 /// evaluator) in `goal <name> met|missed (...)` form. Empty goals leaves the
-/// output byte-identical to the pre-goal version.
+/// output byte-identical to the pre-goal version. When `terminal_month` is
+/// `Some(N)`, the run was cut short by a `death` event and a final
+/// `terminal at month N (death event)` line is appended after the goals.
 fn format_text_summary(
     stats: &[Stats],
     saving_breach: Option<u16>,
     goals: &[GoalOutcome],
+    terminal_month: Option<u16>,
 ) -> String {
     let last = stats.last().unwrap();
     let months = stats.len().saturating_sub(1);
@@ -1044,6 +1072,9 @@ fn format_text_summary(
             ));
         }
     }
+    if let Some(month) = terminal_month {
+        out.push_str(&format!("terminal at month {month} (death event)\n"));
+    }
     out
 }
 
@@ -1065,14 +1096,15 @@ fn main() {
     };
     let horizon = scenario.horizon;
     let stats = scenario.run(horizon);
-    let goals = evaluate_goals(&stats, &scenario.goals, None);
+    let terminal_month = scenario.terminated.then(|| stats.len() as u16 - 1);
+    let goals = evaluate_goals(&stats, &scenario.goals, terminal_month);
     if json {
-        println!("{}", stats_json(&stats, &goals));
+        println!("{}", stats_json(&stats, &goals, terminal_month));
         return;
     }
     if std::io::stdout().is_terminal() {
         let keys = key_stats(&stats);
-        if let Err(e) = tui::run(&stats, &keys, &goals) {
+        if let Err(e) = tui::run(&stats, &keys, &goals, terminal_month) {
             eprintln!("{e}");
             std::process::exit(1);
         }
@@ -1080,7 +1112,7 @@ fn main() {
     }
     print!(
         "{}",
-        format_text_summary(&stats, scenario.saving_breach_month, &goals)
+        format_text_summary(&stats, scenario.saving_breach_month, &goals, terminal_month)
     );
 }
 
@@ -1283,6 +1315,7 @@ events:
             min_cash: 0.0,
             horizon: 12,
             goals: Vec::new(),
+            terminated: false,
         };
         let stats = s.run(12);
         assert_eq!(stats.len(), 13);
@@ -1975,7 +2008,7 @@ events:
     fn format_text_summary_pipes_byte_for_byte() {
         // The non-terminal text path must reproduce the pre-TUI summary byte-for-byte.
         let stats = vec![s(100.0, 50.0, 25.0), s(75.0, 60.0, -25.0)];
-        let out = format_text_summary(&stats, None, &[]);
+        let out = format_text_summary(&stats, None, &[], None);
         assert_eq!(
             out,
             "after 1 months: cash 75.00, assets 60.00, monthly cashflow -25.00\n"
@@ -1985,7 +2018,7 @@ events:
     #[test]
     fn format_text_summary_appends_insolvent_line() {
         let stats = vec![s(100.0, 0.0, 0.0), s(-1.0, 0.0, 0.0), s(50.0, 0.0, 0.0)];
-        let out = format_text_summary(&stats, None, &[]);
+        let out = format_text_summary(&stats, None, &[], None);
         assert_eq!(
             out,
             "after 2 months: cash 50.00, assets 0.00, monthly cashflow 0.00\n\
@@ -1996,7 +2029,7 @@ events:
     #[test]
     fn format_text_summary_omits_insolvent_line_when_solvent() {
         let stats = vec![s(100.0, 0.0, 0.0), s(50.0, 0.0, 0.0), s(0.5, 0.0, 0.0)];
-        let out = format_text_summary(&stats, None, &[]);
+        let out = format_text_summary(&stats, None, &[], None);
         assert_eq!(
             out,
             "after 2 months: cash 0.50, assets 0.00, monthly cashflow 0.00\n"
@@ -2017,7 +2050,7 @@ events:
             .unwrap()
             .into_scenario().unwrap();
         let stats = s.run(12);
-        let parsed: serde_json::Value = serde_json::from_str(&stats_json(&stats, &[])).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&stats_json(&stats, &[], None)).unwrap();
         let months = parsed["months"].as_array().unwrap();
         assert_eq!(months.len(), 13);
         for (i, obj) in months.iter().enumerate() {
@@ -2040,7 +2073,7 @@ events:
             .unwrap()
             .into_scenario().unwrap();
         let stats = s.run(12);
-        let parsed: serde_json::Value = serde_json::from_str(&stats_json(&stats, &[])).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&stats_json(&stats, &[], None)).unwrap();
         let months = parsed["months"].as_array().unwrap();
         let last = months.last().unwrap();
         let s_last = stats.last().unwrap();
@@ -2230,7 +2263,7 @@ events:
     #[test]
     fn format_text_summary_appends_saving_breach_line() {
         let stats = vec![s(100.0, 0.0, 0.0), s(50.0, 0.0, 0.0)];
-        let out = format_text_summary(&stats, Some(0), &[]);
+        let out = format_text_summary(&stats, Some(0), &[], None);
         assert!(out.contains("saving target breached at month 0\n"), "got: {out}");
     }
 
@@ -2417,7 +2450,7 @@ events:
 ";
         let mut a = serde_yaml_ng::from_str::<ScenarioInput>(base).unwrap().into_scenario().unwrap();
         let stats_a = a.run(12);
-        let out_a = format_text_summary(&stats_a, a.saving_breach_month, &[]);
+        let out_a = format_text_summary(&stats_a, a.saving_breach_month, &[], None);
         assert!(!out_a.contains("goal"), "no-goals output must not mention goals: {out_a}");
 
         let mut b = serde_yaml_ng::from_str::<ScenarioInput>(&format!("{base}goals: []\n"))
@@ -2425,7 +2458,7 @@ events:
             .into_scenario().unwrap();
         let stats_b = b.run(12);
         let outcomes_b = evaluate_goals(&stats_b, &b.goals, None);
-        let out_b = format_text_summary(&stats_b, b.saving_breach_month, &outcomes_b);
+        let out_b = format_text_summary(&stats_b, b.saving_breach_month, &outcomes_b, None);
         assert_eq!(out_a, out_b, "empty goals list must not change the text summary");
     }
 
@@ -2445,7 +2478,7 @@ events:
         let stats = s.run(2);
         // saving target 0 means breach only if cash < 0; cash stays positive.
         let outcomes = evaluate_goals(&stats, &s.goals, None);
-        let out = format_text_summary(&stats, s.saving_breach_month, &outcomes);
+        let out = format_text_summary(&stats, s.saving_breach_month, &outcomes, None);
         assert_eq!(s.saving_breach_month, None, "no saving breach expected");
         assert!(out.contains("goal college met"), "got: {out}");
         assert!(out.contains("at month 2"), "got: {out}");
@@ -2462,7 +2495,7 @@ events:
         );
         let stats2 = s2.run(3);
         let outcomes2 = evaluate_goals(&stats2, &s2.goals, None);
-        let out2 = format_text_summary(&stats2, s2.saving_breach_month, &outcomes2);
+        let out2 = format_text_summary(&stats2, s2.saving_breach_month, &outcomes2, None);
         assert_eq!(s2.saving_breach_month, Some(0), "saving should breach on month 0");
         assert!(out2.contains("saving target breached at month 0\n"), "got: {out2}");
         assert!(out2.contains("goal college met"), "got: {out2}");
@@ -2474,7 +2507,7 @@ events:
         let mut s = scenario("cash: 100\nevents: []");
         let stats = s.run(1);
         let outcomes = evaluate_goals(&stats, &s.goals, None);
-        let parsed: serde_json::Value = serde_json::from_str(&stats_json(&stats, &outcomes)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&stats_json(&stats, &outcomes, None)).unwrap();
         let goals = parsed["goals"].as_array().expect("goals field must be an array");
         assert_eq!(goals.len(), 0);
 
@@ -2491,7 +2524,7 @@ events:
             })
             .collect();
         let outcomes2 = evaluate_goals(&stats2, &goals_in, None);
-        let parsed2: serde_json::Value = serde_json::from_str(&stats_json(&stats2, &outcomes2)).unwrap();
+        let parsed2: serde_json::Value = serde_json::from_str(&stats_json(&stats2, &outcomes2, None)).unwrap();
         let arr = parsed2["goals"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["name"], "college");
@@ -2712,6 +2745,121 @@ events:
                     assert_eq!(*annualized_rate, 0.0);
                 }
             }
+        }
+    }
+
+    // ---- Event: death (terminal scenario) ----
+
+    #[test]
+    fn death_event_terminates_run() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - { when: 60, type: death }",
+        );
+        let stats = s.run(360);
+        assert_eq!(stats.len(), 61); // months 0..=60
+        assert!(s.terminated);
+    }
+
+    #[test]
+    fn death_with_no_other_events_produces_one_month() {
+        let mut s = scenario("cash: 0\nevents:\n  - { when: 0, type: death }");
+        let stats = s.run(360);
+        assert_eq!(stats.len(), 1);
+        assert!(s.terminated);
+    }
+
+    #[test]
+    fn scheduled_payout_fires_at_death_month() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - { when: 24, type: death }
+  - { when: 24, type: one_off_income, one_off: { amount: 1000 } }",
+        );
+        let stats = s.run(360);
+        assert_eq!(stats[24].monthly_cashflow, 1000.0);
+        assert!(s.terminated);
+        // the death month is terminal — no stats past 24
+        assert_eq!(stats.len(), 25);
+    }
+
+    #[test]
+    fn no_death_event_runs_to_horizon_unchanged() {
+        let mut s = scenario(
+            "cash: 100
+events:
+  - { when: 0, type: expense, rent: { monthly: 0, annualized_rate: 0.0 } }",
+        );
+        let stats = s.run(5);
+        assert_eq!(stats.len(), 6);
+        assert!(!s.terminated);
+    }
+
+    #[test]
+    fn text_summary_reports_termination() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - { when: 12, type: death }",
+        );
+        let stats = s.run(360);
+        let out = format_text_summary(&stats, None, &[], Some(12));
+        assert!(
+            out.ends_with("terminal at month 12 (death event)\n"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn text_summary_omits_termination_when_no_death_event() {
+        let stats = vec![s(100.0, 50.0, 25.0), s(75.0, 60.0, -25.0)];
+        let out = format_text_summary(&stats, None, &[], None);
+        assert!(!out.contains("terminal"), "got: {out}");
+        assert_eq!(
+            out,
+            "after 1 months: cash 75.00, assets 60.00, monthly cashflow -25.00\n"
+        );
+    }
+
+    #[test]
+    fn json_output_wraps_array() {
+        let yaml = "cash: 0\nevents:\n  - { when: 24, type: death }\n  - { when: 24, type: one_off_income, one_off: { amount: 1000 } }\n";
+        let mut s = scenario(yaml);
+        let stats = s.run(360);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stats_json(&stats, &[], Some(24))).unwrap();
+        assert_eq!(parsed["terminal"], true);
+        assert_eq!(parsed["terminal_month"], 24);
+        let months = parsed["months"].as_array().unwrap();
+        assert_eq!(months.len(), 25);
+
+        // non-terminated run
+        let mut s2 = scenario("cash: 100\nevents: []");
+        let stats2 = s2.run(3);
+        let parsed2: serde_json::Value =
+            serde_json::from_str(&stats_json(&stats2, &[], None)).unwrap();
+        assert_eq!(parsed2["terminal"], false);
+        assert!(parsed2.get("terminal_month").is_none());
+        assert_eq!(parsed2["months"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn json_per_month_shape_unchanged() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - { when: 60, type: death }",
+        );
+        let stats = s.run(360);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stats_json(&stats, &[], Some(60))).unwrap();
+        for obj in parsed["months"].as_array().unwrap() {
+            assert!(obj.get("month").is_some());
+            assert!(obj.get("cash").is_some());
+            assert!(obj.get("assets_value").is_some());
+            assert!(obj.get("monthly_cashflow").is_some());
         }
     }
 }

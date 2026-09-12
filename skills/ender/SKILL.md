@@ -23,11 +23,13 @@ cargo run --quiet -- --json scenarios/foo.yaml   # full monthly series as JSON
   `saving target breached at month N` if a `saving:` target was set, and
   one `goal <name> met|missed (...)` line per declared goal (in `by_month`
   order).
-- JSON is a wrapper object: `months` is the per-month array of
-  `{month, cash, assets_value, monthly_cashflow}` objects, `goals` is the
-  array of `{name, target, by_month, kind: "cash"|"net_worth", met, value}`
-  outcomes. `goals` is always present, `[]` when no goals declared. Use
-  it when you need intermediate values (e.g. cash at a specific age).
+- JSON is a wrapper object: `terminal` is `true` when a `death` event
+  cut the run short, `terminal_month` is the integer month it stopped at
+  (only present when `terminal` is `true`), `months` is the per-month array
+  of `{month, cash, assets_value, monthly_cashflow}` objects, `goals` is
+  the array of `{name, target, by_month, kind: "cash"|"net_worth", met,
+  value}` outcomes. `goals` is always present, `[]` when no goals declared.
+  Use it when you need intermediate values (e.g. cash at a specific age).
 - Deterministic — there is no Monte Carlo. Model risk explicitly with
   `downturn` events instead.
 
@@ -52,6 +54,7 @@ Events: `- when: <month from 0>`, `type:`, plus fields. Types:
 | `downturn` | `equity_drop`, `property_drop`, `rent_drop` (fractions, default 0) | one-shot hit to funds/property values/rent |
 | `refinance` | `id:, monthly:` | replaces a mortgage's monthly payment by id |
 | `pay_change` | `monthly:, annualized_rate:, id:` | updates a salary (first one, or by id) |
+| `death` | none | ends the simulation at the firing month; pair with a scheduled `one_off_income` for life-insurance payouts |
 
 Goals — a list of planning targets to evaluate at a chosen month. Each
 goal carries `name` (label), `target` (the dollar threshold to hit),
@@ -109,6 +112,56 @@ retirement corpus):
 goals:
   - { name: college, target: 200000, by_month: 240, kind: cash }
   - { name: retirement, target: 1500000, by_month: 360, kind: net_worth }
+```
+
+## Risk management / insurance modeling
+
+Insurance is composed from existing primitives — there is no dedicated
+`insurance` event. The `death` event is the terminal marker that ties
+the patterns together: it ends the run at its `when` month, after the
+firing month's cashflows settle, so any `one_off_income` paired with it
+lands on the same month as the death.
+
+**Life insurance** — a recurring premium expense from `when: 0`, a
+`one_off_income` of the policy's payout at the assumed death month,
+and a `death` event at the same month. The terminal cash after the
+payout is the estate's liquid value at death. Example
+(`scenarios/insurance-life.yaml`):
+
+```yaml
+start: 2026-01
+end: 2086-01            # 60-year horizon
+cash: 200000
+events:
+  - { when: 0,   type: expense, id: term-premium, rent: { monthly: 200, annualized_rate: 0.0 } }
+  - { when: 720, type: one_off_income, id: life-payout, one_off: { amount: 1000000 } }
+  - { when: 720, type: death }
+```
+
+Run output ends with `terminal at month 720 (death event)` and `--json`
+adds `terminal: true, terminal_month: 720` to the wrapper.
+
+**Income protection / disability** — a recurring premium expense, the
+main job ending via `end: {id: main-job}` at the disability month, and
+a replacement income stream from that month onward. No `death` event:
+the run continues at a lower income level until the horizon. Use
+`rental_income` attached to a zero-priced `buy_to_let` as the
+replacement stream — ender has no dedicated pension primitive yet
+(`add-pension-cashflow` will add one). Example
+(`scenarios/insurance-disability.yaml`):
+
+```yaml
+cash: 500000
+events:
+  - { when: 0,   type: job, id: main-job, salary: { monthly: 80000, annualized_rate: 0.03 } }
+  - { when: 0,   type: expense, id: cover-premium, rent: { monthly: 150, annualized_rate: 0.0 } }
+  - { when: 240, type: end, id: main-job }
+  - when: 240
+    type: buy_to_let
+    property:
+      sqft: 1; price_per_sqft: 0; capex_per_sqft: 0; annualized_rate: 0.0
+      mortgage: { mortgage: { monthly: 0, period: 1 } }
+      rental: { rental_income: { occupancy: 1.0, monthly: 30000, annualized_rate: 0.0 } }
 ```
 
 ## Simulation semantics (know these before interpreting)
