@@ -5,15 +5,26 @@
 Load a scenario (starting cash + events) from a YAML file into a runnable `Scenario`, with defined error reporting for invalid files.
 ## Requirements
 ### Requirement: Scenario is defined in a YAML file
-The system SHALL load a scenario from a YAML file containing starting `cash` and a list of `events`, where each event has a `when` (month index, 0-based) and a `type` discriminator. Supported event types SHALL include `job`, `expense`, `tuition`, `layoff`, `graduate`, `buy_home`, `buy_to_let`, `investment`, `end`, `one_off_expense`, `one_off_income`, and `death`.
+The system SHALL load a scenario from a YAML file containing starting `cash` and a list of `events`, where each event has a `when` (month index, 0-based) and a `type` discriminator. Supported event types SHALL include `job`, `pension`, `expense`, `tuition`, `layoff`, `graduate`, `buy_home`, `buy_to_let`, `investment`, `end`, `one_off_expense`, `one_off_income`, and `death`.
 
 #### Scenario: Minimal scenario
 - **WHEN** a YAML file contains `cash: 20000` and an empty `events` list
 - **THEN** loading it yields a `Scenario` with 20000.0 cash, no cashflows, no assets, and no events
 
 #### Scenario: Full event vocabulary
-- **WHEN** a YAML file uses each event type — `job`, `expense`, `tuition`, `buy_home`, `buy_to_let`, `investment`, `end`, `one_off_expense`, `one_off_income`, `death` — with their required fields
+- **WHEN** a YAML file uses each event type — `job`, `pension`, `expense`, `tuition`, `buy_home`, `buy_to_let`, `investment`, `end`, `one_off_expense`, `one_off_income`, `death` — with their required fields
 - **THEN** loading it yields a `Scenario` whose cashflow and asset lists contain the corresponding items, and whose event list contains the `end` and `death` events
+
+### Requirement: Pension event adds a non-MPF income cashflow
+The scenario file SHALL accept a new event type `pension` alongside `job`, `expense`, `tuition`, and the other existing variants. The event SHALL carry a body map `pension: {monthly, annualized_rate}` mirroring the shape of `salary`. When the event fires, the system SHALL add a `Pension` cashflow item to the scenario's cashflow list whose `monthly` and `annualized_rate` equal the body's fields. The pension's `monthly` SHALL grow by `(1 + annualized_rate)^(1/12)` per simulated month, identical to how `salary` / `rent` / `tuition` grow, and SHALL be paid in full into cash with no MPF deduction. Pension gross SHALL feed the salaries-tax base; see capability `hk-salaries-tax` for the tax treatment.
+
+#### Scenario: Pension event adds a non-MPF income cashflow
+- **WHEN** a scenario declares `{ type: pension, when: 360, pension: {monthly: 15000, annualized_rate: 0.025} }`
+- **THEN** after month 360 the cashflow list contains a `Pension` item with `monthly: 15000.0` and `annualized_rate: 0.025`, and the next simulated month reports a `monthly_cashflow` of `+15000.0` (not `+15000 - MPF`) and `cash` increases by 15000 from the prior month.
+
+#### Scenario: Pension event rejected without body
+- **WHEN** a scenario declares `type: pension` with no `pension` body
+- **THEN** loading fails with an error naming the file.
 
 ### Requirement: Death event ends the simulation at its firing month
 A `death` event SHALL be a supported event type with no body. When the event fires (at its `when` month), the system SHALL apply any other events scheduled for that month and settle the firing month's cashflows (including any scheduled `one_off_income` payouts), and SHALL then stop the simulation: no further months are simulated, no further events fire, and the run reports the firing month as the terminal month. A scenario that does not declare a `death` event SHALL run to the configured horizon exactly as before.

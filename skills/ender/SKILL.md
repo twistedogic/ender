@@ -52,6 +52,7 @@ Events: `- when: <month from 0>`, `type:`, plus fields. Types:
 | type | body | effect |
 |---|---|---|
 | `job` | `salary: {monthly, annualized_rate}` | income, net of MPF (5%, cap 1500/mo) |
+| `pension` | `pension: {monthly, annualized_rate}` | income, no MPF, assessable for salaries tax |
 | `expense` | `rent:` or `tuition:` map | recurring cost (identical math, label differs) |
 | `layoff` | `id:` | removes that salary |
 | `graduate` | `id:` | removes that tuition |
@@ -121,6 +122,26 @@ goals:
   - { name: college, target: 200000, by_month: 240, kind: cash }
   - { name: retirement, target: 1500000, by_month: 360, kind: net_worth }
 ```
+
+## Pension income (post-retirement cashflow)
+
+`pension` is recurring post-retirement income that does NOT net MPF. The
+gross amount flows into `salary_accrued` and is assessable under salaries
+tax the same way a salary is — but the cashflow itself stays at the full
+gross. Work an `end: {id: ...}` to stop it.
+
+```yaml
+cash: 200000
+events:
+  - { when: 0,   type: job,     id: main-job, salary: { monthly: 80000, annualized_rate: 0.03 } }
+  - { when: 360, type: end,     id: main-job }
+  - { when: 360, type: pension, pension: { monthly: 15000, annualized_rate: 0.025 } }
+```
+
+The `end` stops the salary; the `pension` then carries the next block
+(12 × 15k = 180k gross against the allowance, no MPF). `annualized_rate`
+is model-agnostic — use 2.5–3% for HK civil-service CPI indexation,
+whatever fits the scheme you are modelling.
 
 ## Risk management / insurance modeling
 

@@ -22,8 +22,9 @@ salary, capped at HKD 1,500.
 At the end of every 12-month block (months 11, 23, 35, ...), the system
 SHALL charge Hong Kong salaries tax on gross salary accrued during that
 block, deducted from cash. Accrued salary is the sum of the 12 monthly gross
-amounts (gross = net cashflow + MPF deducted). The chargeable computation
-SHALL be the minimum of:
+amounts (gross = net cashflow + MPF deducted) plus any active `Pension`
+cashflow's monthly gross (which is not netted of MPF). The chargeable
+computation SHALL be the minimum of:
 
 - Progressive tax on net chargeable income = accrued gross − accrued MPF −
   basic allowance, using brackets 50k @ 2%, 50k @ 6%, 50k @ 10%, 50k @ 14%,
@@ -44,6 +45,14 @@ SHALL be the minimum of:
 #### Scenario: Partial-year accrual after mid-block layoff
 - **WHEN** salary is removed after 6 of 12 months in a block
 - **THEN** salaries tax is computed on the 6 accrued months only
+
+#### Scenario: Pension accrues into salaries tax with no salary
+- **WHEN** a scenario has only a pension of 20000 active for a full 12 months and no salary items
+- **THEN** at month 11 the salaries-tax charge is computed against `salary_accrued = 12 * 20000 = 240000` minus MPF (zero) minus the allowance — pension is treated as a salary-equivalent for the tax base, with no MPF deduction.
+
+#### Scenario: Pension stacks with salary in the salaries-tax base
+- **WHEN** a scenario has a salary of 30000 and a pension of 10000 active for a full 12 months
+- **THEN** `salary_accrued` is `12 * (30000 + 10000) = 480000` and `mpf_accrued` is `12 * mpf_monthly(30000)` — pension contributes to the salaries-tax base but does not contribute to MPF.
 
 ### Requirement: Basic allowance is a code constant
 The system SHALL default the salaries-tax basic allowance to HKD 132,000,

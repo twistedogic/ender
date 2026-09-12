@@ -202,6 +202,13 @@ enum CashflowItem {
         monthly: f64,
         annualized_rate: f64,
     },
+    /// Post-retirement recurring income. No MPF deduction; the gross amount
+    /// is added to `salary_accrued` for the annual salaries-tax charge, the
+    /// same way a Salary is.
+    Pension {
+        monthly: f64,
+        annualized_rate: f64,
+    },
     OneOff {
         amount: f64,
         #[serde(default)]
@@ -267,6 +274,14 @@ impl CashflowItem {
                 *monthly *= (1.0 + *annualized_rate).powf(1.0 / 12.0);
                 (Cashflow::Expense(m), m.abs())
             }
+            Self::Pension {
+                monthly,
+                annualized_rate,
+            } => {
+                let m = *monthly;
+                *monthly *= (1.0 + *annualized_rate).powf(1.0 / 12.0);
+                (Cashflow::Income(m), 0.0)
+            }
             Self::OneOff { amount, fired } => {
                 if *fired {
                     return (Cashflow::Income(0.0), 0.0);
@@ -277,15 +292,18 @@ impl CashflowItem {
         }
     }
 
-    /// (salary gross, rent collected) for annual tax accrual. Reads
-    /// pre-mutation amounts — call before `monthly()` grows them.
-    fn tax_accrual(&self) -> (f64, f64) {
+    /// (salary gross, rent collected, mpf contribution) for annual tax
+    /// accrual. Reads pre-mutation amounts — call before `monthly()` grows
+    /// them. MPF is per-item so a non-MPF salary-equivalent like Pension
+    /// can flow into the salaries-tax base without inflating MPF accrual.
+    fn tax_accrual(&self) -> (f64, f64, f64) {
         match self {
-            Self::Salary { monthly, .. } => (*monthly, 0.0),
+            Self::Salary { monthly, .. } => (*monthly, 0.0, mpf_monthly(*monthly)),
             Self::RentalIncome {
                 monthly, occupancy, ..
-            } => (0.0, monthly * occupancy),
-            _ => (0.0, 0.0),
+            } => (0.0, monthly * occupancy, 0.0),
+            Self::Pension { monthly, .. } => (*monthly, 0.0, 0.0),
+            _ => (0.0, 0.0, 0.0),
         }
     }
 }
@@ -403,6 +421,7 @@ enum EventType {
     Investment(Asset),
     OneOffExpense(Labeled),
     OneOffIncome(Labeled),
+    Pension(Labeled),
     End { id: String },
     /// One-shot percentage drop to funds and/or properties in the firing
     /// month. No cashflow; the post-drop base resumes monthly growth.
@@ -460,6 +479,7 @@ impl EventType {
                 }
                 s.cashflow.push(i);
             }
+            Self::Pension(i) => s.cashflow.push(i),
 
             Self::Graduate { id } => s.remove_cashflow(
                 id.as_deref(),
@@ -673,18 +693,18 @@ impl Scenario {
         let mut cashflow = 0.0;
         let mut expense_base = 0.0;
         for flow in self.cashflow.iter_mut() {
-            let (gross, rent) = flow.item.tax_accrual();
+            let (gross, rent, mpf) = flow.item.tax_accrual();
             let (cf, base) = flow.monthly();
             cashflow += cf.value();
             expense_base += base;
             self.salary_accrued += gross;
-            self.mpf_accrued += mpf_monthly(gross);
+            self.mpf_accrued += mpf;
             self.rent_accrued += rent;
         }
         for asset in self.assets.iter_mut() {
-            let (_, rent) = match asset {
+            let (_, rent, _) = match asset {
                 Asset::Property { rental: Some(r), .. } => r.item.tax_accrual(),
-                _ => (0.0, 0.0),
+                _ => (0.0, 0.0, 0.0),
             };
             let (cf, base) = asset.monthly();
             cashflow += cf.value();
@@ -2946,5 +2966,164 @@ events:
             assert!(obj.get("assets_value").is_some());
             assert!(obj.get("monthly_cashflow").is_some());
         }
+    }
+
+    // ---- Event: pension ----
+
+    #[test]
+    fn pension_event_adds_cashflow() {
+        let yaml = "
+cash: 0
+events:
+  - when: 0
+    type: pension
+    pension: { monthly: 15000, annualized_rate: 0.025 }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario()
+            .unwrap();
+        s.once();
+        assert_eq!(s.cashflow.len(), 1);
+        assert!(matches!(s.cashflow[0].item, CashflowItem::Pension { .. }));
+    }
+
+    #[test]
+    fn pension_is_income_no_mpf() {
+        let mut s = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: pension, pension: { monthly: 20000, annualized_rate: 0.0 } }",
+        );
+        let stats = s.run(1);
+        // full gross lands as income; no MPF deduction, no negative sign
+        assert_eq!(stats[0].monthly_cashflow, 20_000.0);
+        assert_eq!(stats[1].monthly_cashflow, 20_000.0);
+    }
+
+    #[test]
+    fn pension_grows_like_salary() {
+        // Salary's growth path: `*monthly *= (1 + annualized_rate)^(1/12)` each
+        // month. Pension uses the same multiplier — after one month its monthly
+        // should equal salary's month-2 monthly within float tolerance.
+        let mut sa = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: job, salary: { monthly: 10000, annualized_rate: 0.12 } }",
+        );
+        sa.run(2);
+        let salary_month2 = match &sa.cashflow[0].item {
+            CashflowItem::Salary { monthly, .. } => *monthly,
+            _ => panic!("expected salary"),
+        };
+
+        let mut sp = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: pension, pension: { monthly: 10000, annualized_rate: 0.12 } }",
+        );
+        sp.run(2);
+        let pension_month2 = match &sp.cashflow[0].item {
+            CashflowItem::Pension { monthly, .. } => *monthly,
+            _ => panic!("expected pension"),
+        };
+
+        assert!((salary_month2 - pension_month2).abs() < 1e-9,
+            "salary month-2 {salary_month2} != pension month-2 {pension_month2}");
+    }
+
+    #[test]
+    fn pension_accrues_into_salaries_tax() {
+        // Only pension of 20k for 12 months: salary_accrued = 240_000,
+        // mpf_accrued = 0. Progressive chargeable = 240_000 - 0 - 132_000
+        // = 108_000 -> 50k @ 2% (1_000) + 50k @ 6% (3_000) + 8k @ 10% (800)
+        // = 4_800. Standard = 240_000 * 15% = 36_000. Min = 4_800.
+        let mut s = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: pension, pension: { monthly: 20000, annualized_rate: 0.0 } }",
+        );
+        let stats = s.run(11);
+        let expected = 12.0 * 20_000.0 - 4_800.0;
+        assert!((stats[11].cash - expected).abs() < 0.01,
+            "got {}, expected {}", stats[11].cash, expected);
+    }
+
+    #[test]
+    fn pension_does_not_inflate_mpf_accrued() {
+        // Salary 20000/mo (mpf 1000 below cap) + pension 20000/mo.
+        // If pension incorrectly added MPF, monthly cashflow diff would be
+        // pension - extra_mpf = 20_000 - 1_000 = 19_000 instead of 20_000.
+        let mut a = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: job, salary: { monthly: 20000, annualized_rate: 0.0 } }",
+        );
+        let stats_a = a.run(11);
+        let mut b = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: job, salary: { monthly: 20000, annualized_rate: 0.0 } }
+  - { when: 0, type: pension, pension: { monthly: 20000, annualized_rate: 0.0 } }",
+        );
+        let stats_b = b.run(11);
+        for i in 0..=11 {
+            let diff = stats_b[i].monthly_cashflow - stats_a[i].monthly_cashflow;
+            assert!((diff - 20_000.0).abs() < 0.01,
+                "month {i}: cashflow diff {diff} != 20_000 (pension should not add MPF)");
+        }
+    }
+
+    #[test]
+    fn pension_stacks_with_salary_in_tax_base() {
+        // Salary 30k + pension 10k for 12 months:
+        //   salary_accrued = 12 * 30_000 + 12 * 10_000 = 480_000
+        //   mpf_accrued    = 12 * mpf_monthly(30_000)   = 12 * 1_500 = 18_000
+        //   chargeable     = 480_000 - 18_000 - 132_000 = 330_000
+        //   progressive    = 1_000 + 3_000 + 5_000 + 7_000 + 22_100 = 38_100
+        //   standard       = 480_000 * 15%               = 72_000.  Min = 38_100.
+        let mut s = scenario(
+            "cash: 0
+events:
+  - { when: 0, type: job, salary: { monthly: 30000, annualized_rate: 0.0 } }
+  - { when: 0, type: pension, pension: { monthly: 10000, annualized_rate: 0.0 } }",
+        );
+        let stats = s.run(11);
+        let net = 12.0 * (30_000.0 - 1_500.0 + 10_000.0);
+        let tax = 38_100.0;
+        assert!((stats[11].cash - (net - tax)).abs() < 0.01,
+            "got {}, expected {}", stats[11].cash, net - tax);
+    }
+
+    #[test]
+    fn end_removes_pension_by_id() {
+        let yaml = "
+cash: 0
+events:
+  - { when: 0, type: pension, id: civ_serv, pension: { monthly: 10000, annualized_rate: 0.0 } }
+  - { when: 5, type: end, id: civ_serv }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario()
+            .unwrap();
+        let stats = s.run(7);
+        // Months 0..=4: pension pays 10k/mo. Month 5 fires end; month 6+ no pension.
+        assert_eq!(stats[4].monthly_cashflow, 10_000.0);
+        assert_eq!(stats[5].monthly_cashflow, 0.0);
+        assert_eq!(stats[6].monthly_cashflow, 0.0);
+        assert_eq!(stats[7].monthly_cashflow, 0.0);
+    }
+
+    #[test]
+    fn pension_without_body_fails_to_load() {
+        let path = write_tmp(
+            "ender_pension_no_body.yaml",
+            "cash: 0\nevents:\n  - { when: 0, type: pension }\n",
+        );
+        let Err(err) = load(&path) else {
+            panic!("expected load to fail")
+        };
+        assert!(err.contains("ender_pension_no_body.yaml"), "error: {err}");
     }
 }
