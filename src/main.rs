@@ -2,6 +2,7 @@ use std::io::IsTerminal;
 
 use serde::{Deserialize, Serialize};
 
+mod compare;
 mod tui;
 
 #[derive(Clone, Copy)]
@@ -895,21 +896,35 @@ fn load(path: &std::path::Path) -> Result<Scenario, String> {
         .map_err(|e| format!("{path_str}: {e}"))
 }
 
-/// Parse CLI args: first non-flag is the path (default `scenario.yaml`),
-/// `--json` may appear anywhere, any other `-`-prefixed arg is an error.
-fn parse_args(args: &[String]) -> Result<(String, bool), String> {
-    let mut path: Option<String> = None;
+/// CLI mode: a single scenario path or a `compare` subcommand with N
+/// scenario paths. `--json` is captured separately and applies to either.
+#[derive(Debug, PartialEq)]
+enum Mode {
+    Single(String),
+    Compare(Vec<String>),
+}
+
+/// Parse CLI args: `--json` may appear anywhere; the first non-flag arg
+/// decides `Mode` (`compare` → `Compare`, anything else → `Single` with
+/// that arg as the path, defaulting to `scenario.yaml` when no non-flag
+/// arg is given); any other `-`-prefixed arg is an error.
+fn parse_args(args: &[String]) -> Result<(Mode, bool), String> {
+    let mut positional: Vec<String> = Vec::new();
     let mut json = false;
     for a in args {
         if a == "--json" {
             json = true;
         } else if a.starts_with('-') {
             return Err(format!("unknown flag: {a}"));
-        } else if path.is_none() {
-            path = Some(a.clone());
+        } else {
+            positional.push(a.clone());
         }
     }
-    Ok((path.unwrap_or_else(|| "scenario.yaml".to_string()), json))
+    match positional.first().map(String::as_str) {
+        None => Ok((Mode::Single("scenario.yaml".to_string()), json)),
+        Some("compare") => Ok((Mode::Compare(positional[1..].to_vec()), json)),
+        Some(path) => Ok((Mode::Single(path.to_string()), json)),
+    }
 }
 
 /// Evaluate each goal against the post-run `stats` series. The evaluation
@@ -990,6 +1005,7 @@ fn stats_json(stats: &[Stats], goals: &[GoalOutcome], terminal_month: Option<u16
 /// Derived run-level statistics shown by the TUI header. Insolvency uses the
 /// same `cash < 0.0` rule as the text summary; the minimum is reported with
 /// the first month it occurs at (ties go to the earliest month).
+#[derive(Debug)]
 struct KeyStats {
     final_cash: f64,
     final_assets_value: f64,
@@ -1080,40 +1096,56 @@ fn format_text_summary(
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (path, json) = match parse_args(&args) {
+    let (mode, json) = match parse_args(&args) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1);
         }
     };
-    let mut scenario = match load(std::path::Path::new(&path)) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
+    match mode {
+        Mode::Compare(paths) => {
+            if paths.is_empty() {
+                eprintln!("usage: ender compare <path>...");
+                std::process::exit(1);
+            }
+            let paths: Vec<std::path::PathBuf> =
+                paths.into_iter().map(std::path::PathBuf::from).collect();
+            if let Err(e) = compare::run(&paths, json) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
         }
-    };
-    let horizon = scenario.horizon;
-    let stats = scenario.run(horizon);
-    let terminal_month = scenario.terminated.then(|| stats.len() as u16 - 1);
-    let goals = evaluate_goals(&stats, &scenario.goals, terminal_month);
-    if json {
-        println!("{}", stats_json(&stats, &goals, terminal_month));
-        return;
-    }
-    if std::io::stdout().is_terminal() {
-        let keys = key_stats(&stats);
-        if let Err(e) = tui::run(&stats, &keys, &goals, terminal_month) {
-            eprintln!("{e}");
-            std::process::exit(1);
+        Mode::Single(path) => {
+            let mut scenario = match load(std::path::Path::new(&path)) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            };
+            let horizon = scenario.horizon;
+            let stats = scenario.run(horizon);
+            let terminal_month = scenario.terminated.then(|| stats.len() as u16 - 1);
+            let goals = evaluate_goals(&stats, &scenario.goals, terminal_month);
+            if json {
+                println!("{}", stats_json(&stats, &goals, terminal_month));
+                return;
+            }
+            if std::io::stdout().is_terminal() {
+                let keys = key_stats(&stats);
+                if let Err(e) = tui::run(&stats, &keys, &goals, terminal_month) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+            print!(
+                "{}",
+                format_text_summary(&stats, scenario.saving_breach_month, &goals, terminal_month)
+            );
         }
-        return;
     }
-    print!(
-        "{}",
-        format_text_summary(&stats, scenario.saving_breach_month, &goals, terminal_month)
-    );
 }
 
 #[cfg(test)]
@@ -1905,42 +1937,95 @@ events:
 
     #[test]
     fn parse_args_defaults_to_scenario_yaml() {
-        let (path, json) = parse_args(&[]).unwrap();
-        assert_eq!(path, "scenario.yaml");
+        let (mode, json) = parse_args(&[]).unwrap();
+        assert_eq!(mode, Mode::Single("scenario.yaml".to_string()));
         assert!(!json);
     }
 
     #[test]
     fn parse_args_takes_explicit_path() {
-        let (path, json) = parse_args(&["s.yaml".to_string()]).unwrap();
-        assert_eq!(path, "s.yaml");
+        let (mode, json) = parse_args(&["s.yaml".to_string()]).unwrap();
+        assert_eq!(mode, Mode::Single("s.yaml".to_string()));
         assert!(!json);
     }
 
     #[test]
     fn parse_args_recognizes_json_alone() {
-        let (path, json) = parse_args(&["--json".to_string()]).unwrap();
-        assert_eq!(path, "scenario.yaml");
+        let (mode, json) = parse_args(&["--json".to_string()]).unwrap();
+        assert_eq!(mode, Mode::Single("scenario.yaml".to_string()));
         assert!(json);
     }
 
     #[test]
     fn parse_args_recognizes_json_before_path() {
-        let (path, json) = parse_args(&["--json".to_string(), "s.yaml".to_string()]).unwrap();
-        assert_eq!(path, "s.yaml");
+        let (mode, json) = parse_args(&["--json".to_string(), "s.yaml".to_string()]).unwrap();
+        assert_eq!(mode, Mode::Single("s.yaml".to_string()));
         assert!(json);
     }
 
     #[test]
     fn parse_args_recognizes_json_after_path() {
-        let (path, json) = parse_args(&["s.yaml".to_string(), "--json".to_string()]).unwrap();
-        assert_eq!(path, "s.yaml");
+        let (mode, json) = parse_args(&["s.yaml".to_string(), "--json".to_string()]).unwrap();
+        assert_eq!(mode, Mode::Single("s.yaml".to_string()));
         assert!(json);
     }
 
     #[test]
     fn parse_args_rejects_unknown_flag_naming_it() {
         let err = parse_args(&["--yaml".to_string()]).unwrap_err();
+        assert!(err.contains("--yaml"), "error should name the flag: {err}");
+    }
+
+    #[test]
+    fn parse_args_routes_compare_with_two_paths() {
+        let (mode, json) =
+            parse_args(&["compare".to_string(), "a.yaml".to_string(), "b.yaml".to_string()])
+                .unwrap();
+        assert_eq!(
+            mode,
+            Mode::Compare(vec!["a.yaml".to_string(), "b.yaml".to_string()])
+        );
+        assert!(!json);
+    }
+
+    #[test]
+    fn parse_args_compare_with_no_paths() {
+        let (mode, _) = parse_args(&["compare".to_string()]).unwrap();
+        assert_eq!(mode, Mode::Compare(vec![]));
+    }
+
+    #[test]
+    fn parse_args_compare_with_one_path() {
+        let (mode, _) = parse_args(&["compare".to_string(), "s.yaml".to_string()]).unwrap();
+        assert_eq!(mode, Mode::Compare(vec!["s.yaml".to_string()]));
+    }
+
+    #[test]
+    fn parse_args_json_before_compare() {
+        let (mode, json) = parse_args(
+            &["--json".to_string(), "compare".to_string(), "a.yaml".to_string()],
+        )
+        .unwrap();
+        assert_eq!(mode, Mode::Compare(vec!["a.yaml".to_string()]));
+        assert!(json);
+    }
+
+    #[test]
+    fn parse_args_json_after_compare_paths() {
+        let (mode, json) = parse_args(
+            &["compare".to_string(), "a.yaml".to_string(), "--json".to_string()],
+        )
+        .unwrap();
+        assert_eq!(mode, Mode::Compare(vec!["a.yaml".to_string()]));
+        assert!(json);
+    }
+
+    #[test]
+    fn parse_args_unknown_flag_after_compare() {
+        let err = parse_args(
+            &["compare".to_string(), "a.yaml".to_string(), "--yaml".to_string()],
+        )
+        .unwrap_err();
         assert!(err.contains("--yaml"), "error should name the flag: {err}");
     }
 

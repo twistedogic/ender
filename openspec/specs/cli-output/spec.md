@@ -2,10 +2,12 @@
 
 ## Purpose
 
-Wire the CLI: accept a scenario path and the `--json` flag, and write either the human summary or a JSON stats series to stdout.
+Wire the CLI: accept a scenario path (single-scenario mode) or a `compare` subcommand with N scenario paths (multi-scenario mode), plus the `--json` flag, and write either the human summary, the JSON stats series, or a side-by-side comparison table to stdout.
 ## Requirements
 ### Requirement: CLI takes a scenario path and optional flags
 The CLI SHALL accept an optional scenario file path as a positional argument (defaulting to `scenario.yaml` when absent) and an optional `--json` flag, in either order relative to the path. Any other argument beginning with `-` SHALL fail with an error message on stderr and exit code 1. Loading errors SHALL be reported on stderr with exit code 1 regardless of `--json`.
+
+When the first non-flag positional argument equals the literal `compare`, the CLI SHALL treat the remaining positional arguments as a list of one or more scenario paths and delegate to the comparison renderer (capability `multi-scenario-comparison`); `--json` continues to apply in that mode. When the first non-flag positional argument is anything else (or absent), the CLI behaves as the single-scenario path described above. A scenario file literally named `compare` (no extension) would be misinterpreted as the subcommand; documented in the skill.
 
 #### Scenario: Default invocation
 - **WHEN** the CLI is run with no arguments
@@ -22,6 +24,18 @@ The CLI SHALL accept an optional scenario file path as a positional argument (de
 #### Scenario: Unknown flag fails
 - **WHEN** the CLI is run with an argument `--yaml` (any `-`-prefixed argument other than `--json`)
 - **THEN** it prints an error naming the unknown flag to stderr and exits with code 1, loading nothing
+
+#### Scenario: `compare` with two scenarios
+- **WHEN** the CLI is run as `ender compare a.yaml b.yaml`
+- **THEN** it routes to the comparison renderer (see capability `multi-scenario-comparison`); single-scenario loading is skipped.
+
+#### Scenario: `compare` with no paths
+- **WHEN** the CLI is run as `ender compare` (no paths)
+- **THEN** it prints `usage: ender compare <path>...` to stderr and exits with code 1; nothing is loaded.
+
+#### Scenario: Unknown flag after `compare`
+- **WHEN** the CLI is run as `ender compare a.yaml --yaml`
+- **THEN** it prints `unknown flag: --yaml` to stderr and exits with code 1, matching the single-scenario unknown-flag error format.
 
 ### Requirement: `--json` emits the per-month stats series
 When `--json` is passed, the CLI SHALL write exactly one JSON document to stdout: a wrapper object with two fields, `months` and `goals`. `months` is a compact array with one object per simulated month, in simulation order, each carrying `month` (0-based index of the month), `cash`, `assets_value`, and `monthly_cashflow` as numbers. `goals` is an array of per-goal outcomes (see capability `goal-tracking`); it is always present and `[]` when the scenario declares no goals. The document SHALL be the only stdout output in this mode, and SHALL be parseable by a standard JSON parser. Without `--json`: when stdout is a terminal, the interactive TUI SHALL be shown instead (capability `tui-display`); when stdout is not a terminal, the human-readable summary (and insolvency line, when applicable) SHALL be printed byte-for-byte as before this change.

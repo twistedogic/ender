@@ -14,10 +14,18 @@ results. The model is Hong Kong-specific (MPF, IRD salaries/property tax).
 ```sh
 cargo run --quiet -- scenarios/foo.yaml          # text summary (non-TTY)
 cargo run --quiet -- --json scenarios/foo.yaml   # full monthly series as JSON
+cargo run --quiet -- compare scenarios/a.yaml scenarios/b.yaml      # side-by-side key stats
+cargo run --quiet -- compare --json scenarios/a.yaml scenarios/b.yaml  # JSON array, one element per scenario
 ```
 
 - No `--help`. Only flags: `--json` (anywhere). First non-flag arg is the path
-  (default `scenario.yaml`).
+  (default `scenario.yaml`), unless it is the literal `compare`, in which case
+  the remaining positional args are scenario paths and `compare` runs them all
+  and emits a side-by-side key-stats table (TTY: ratatui; non-TTY: aligned
+  text; `--json`: a JSON array whose elements mirror the per-scenario wrapper
+  with an added `name` field). A scenario file literally named `compare`
+  (no extension) would be misinterpreted as the subcommand — name scenarios
+  descriptively.
 - Non-TTY stdout prints a 3-line summary: final month (cash, assets,
   monthly cashflow), `insolvent from month N` (first month cash < 0),
   `saving target breached at month N` if a `saving:` target was set, and
