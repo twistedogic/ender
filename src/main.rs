@@ -190,9 +190,9 @@ enum CashflowItem {
     },
     Mortgage {
         monthly: f64,
-        period: u8,
+        period: u16,
         #[serde(default)]
-        paid: u8,
+        paid: u16,
     },
     Investment {
         monthly: f64,
@@ -994,6 +994,23 @@ events:
         assert_eq!(stats[0].cash, 19900.0); // 50000 - 30000 price - 100 mortgage
         assert_eq!(stats[1].cash - stats[0].cash, -100.0);
         assert_eq!(stats[2].cash - stats[1].cash, -100.0);
+    }
+
+    #[test]
+    fn mortgage_period_allows_u16_range() {
+        // 300 = 25-year loan; u8 saturated this to 255 (see scenarios/NOTES.md)
+        let yaml = "
+cash: 0
+events:
+  - when: 0
+    type: buy_home
+    property: { sqft: 1, price_per_sqft: 0, capex_per_sqft: 0, annualized_rate: 0.0, mortgage: { mortgage: { monthly: 100, period: 300 } } }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario().unwrap();
+        let stats = s.run(1);
+        assert_eq!(stats[0].cash, -100.0);
     }
 
     #[test]
@@ -2171,7 +2188,7 @@ events:
             Asset::Property { mortgage, .. } => match &mortgage.item {
                 CashflowItem::Mortgage { monthly, period, .. } => {
                     assert_eq!(*monthly, 2000.0);
-                    assert_eq!(*period as u16, 240);
+                    assert_eq!(*period, 240);
                 }
                 _ => panic!("expected mortgage"),
             },
