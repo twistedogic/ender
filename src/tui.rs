@@ -13,19 +13,19 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::{key_stats, KeyStats, Stats};
+use crate::{GoalOutcome, KeyStats, Stats};
 
 /// Launch the interactive TUI: enter alternate screen + raw mode, render
 /// key statistics over a scrollable per-month table, restore the terminal
 /// on every exit path before returning.
-pub fn run(stats: &[Stats]) -> io::Result<()> {
+pub fn run(stats: &[Stats], keys: &KeyStats, goals: &[GoalOutcome]) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, stats);
+    let result = run_loop(&mut terminal, stats, keys, goals);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -33,14 +33,18 @@ pub fn run(stats: &[Stats]) -> io::Result<()> {
     result
 }
 
-fn run_loop<B: Backend>(terminal: &mut Terminal<B>, stats: &[Stats]) -> io::Result<()> {
-    let keys = key_stats(stats);
+fn run_loop<B: Backend>(
+    terminal: &mut Terminal<B>,
+    stats: &[Stats],
+    keys: &KeyStats,
+    goals: &[GoalOutcome],
+) -> io::Result<()> {
     let mut state = TableState::default();
     state.select(Some(0));
 
     loop {
         let page = page_step(terminal.size()?.height);
-        terminal.draw(|f| ui(f, stats, &keys, &mut state))?;
+        terminal.draw(|f| ui(f, stats, keys, goals, &mut state))?;
         if let Event::Key(key) = event::read()? {
             // Auto-repeat fires both Press and Release in some terminals; only
             // act on the key-down edge so holding a key doesn't double-step.
@@ -75,28 +79,44 @@ fn page_step(height: u16) -> usize {
     height.saturating_sub(9).max(1) as usize
 }
 
-fn ui(f: &mut Frame, stats: &[Stats], keys: &KeyStats, state: &mut TableState) {
+fn ui(f: &mut Frame, stats: &[Stats], keys: &KeyStats, goals: &[GoalOutcome], state: &mut TableState) {
+    // 4 base header lines + 1 blank + 1 help line + one per goal.
+    let header_height = 7 + goals.len() as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(0)])
+        .constraints([Constraint::Length(header_height), Constraint::Min(0)])
         .split(f.area());
 
     let insolvency = match keys.first_insolvent_month {
         Some(m) => format!("month {m}"),
         None => "never".to_string(),
     };
-    let header_text = format!(
+    let mut header_text = format!(
         "final month: cash {:.2}, assets {:.2}, cashflow {:.2}\n\
          min cash: {:.2} at month {}\n\
-         insolvent: {}\n\
-         \n\
-         j/k or arrows scroll · PageUp/PageDown by screen · q/Esc quits",
+         insolvent: {}",
         keys.final_cash,
         keys.final_assets_value,
         keys.final_monthly_cashflow,
         keys.min_cash,
         keys.min_cash_month,
         insolvency,
+    );
+    for g in goals {
+        if g.met {
+            header_text.push_str(&format!(
+                "\ngoal {} met ({:.2} at month {})",
+                g.name, g.value, g.evaluation_month
+            ));
+        } else {
+            header_text.push_str(&format!(
+                "\ngoal {} missed ({:.2} at month {}, target {:.2})",
+                g.name, g.value, g.evaluation_month, g.target
+            ));
+        }
+    }
+    header_text.push_str(
+        "\n\nj/k or arrows scroll · PageUp/PageDown by screen · q/Esc quits",
     );
     let header = Paragraph::new(header_text).block(
         Block::default()
@@ -141,7 +161,7 @@ fn ui(f: &mut Frame, stats: &[Stats], keys: &KeyStats, state: &mut TableState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Stats;
+    use crate::{key_stats, Stats};
     use ratatui::backend::TestBackend;
 
     fn frame_to_string(f: &mut Terminal<TestBackend>) -> String {
@@ -168,7 +188,7 @@ mod tests {
         let mut state = TableState::default();
         state.select(Some(0));
         terminal
-            .draw(|f| ui(f, &stats, &keys, &mut state))
+            .draw(|f| ui(f, &stats, &keys, &[], &mut state))
             .unwrap();
         let rendered = frame_to_string(&mut terminal);
         assert!(rendered.contains("Key statistics"), "rendered: {rendered}");
@@ -188,7 +208,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = TableState::default();
         terminal
-            .draw(|f| ui(f, &stats, &keys, &mut state))
+            .draw(|f| ui(f, &stats, &keys, &[], &mut state))
             .unwrap();
         let rendered = frame_to_string(&mut terminal);
         assert!(rendered.contains("insolvent: month 1"), "rendered: {rendered}");
@@ -209,7 +229,7 @@ mod tests {
         let mut state = TableState::default();
         state.select(Some(12));
         terminal
-            .draw(|f| ui(f, &stats, &keys, &mut state))
+            .draw(|f| ui(f, &stats, &keys, &[], &mut state))
             .unwrap();
         let rendered = frame_to_string(&mut terminal);
         // header row + every data row

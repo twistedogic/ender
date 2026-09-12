@@ -19,17 +19,23 @@ cargo run --quiet -- --json scenarios/foo.yaml   # full monthly series as JSON
 - No `--help`. Only flags: `--json` (anywhere). First non-flag arg is the path
   (default `scenario.yaml`).
 - Non-TTY stdout prints a 3-line summary: final month (cash, assets,
-  monthly cashflow), `insolvent from month N` (first month cash < 0), and
-  `saving target breached at month N` if a `saving:` target was set.
-- JSON rows: `{month, cash, assets_value, monthly_cashflow}` per month.
-  Use it when you need intermediate values (e.g. cash at a specific age).
+  monthly cashflow), `insolvent from month N` (first month cash < 0),
+  `saving target breached at month N` if a `saving:` target was set, and
+  one `goal <name> met|missed (...)` line per declared goal (in `by_month`
+  order).
+- JSON is a wrapper object: `months` is the per-month array of
+  `{month, cash, assets_value, monthly_cashflow}` objects, `goals` is the
+  array of `{name, target, by_month, kind: "cash"|"net_worth", met, value}`
+  outcomes. `goals` is always present, `[]` when no goals declared. Use
+  it when you need intermediate values (e.g. cash at a specific age).
 - Deterministic — there is no Monte Carlo. Model risk explicitly with
   `downturn` events instead.
 
 ## Scenario schema
 
 Top level: `cash` (starting cash), `reserve_months`, `tax`, `start`/`end`
-(`YYYY-MM`, sets horizon), `saving` (cash target to watch), `events`.
+(`YYYY-MM`, sets horizon), `saving` (cash target to watch), `goals` (list
+of planning targets to evaluate at specific months), `events`.
 
 Events: `- when: <month from 0>`, `type:`, plus fields. Types:
 
@@ -46,6 +52,18 @@ Events: `- when: <month from 0>`, `type:`, plus fields. Types:
 | `downturn` | `equity_drop`, `property_drop`, `rent_drop` (fractions, default 0) | one-shot hit to funds/property values/rent |
 | `refinance` | `id:, monthly:` | replaces a mortgage's monthly payment by id |
 | `pay_change` | `monthly:, annualized_rate:, id:` | updates a salary (first one, or by id) |
+
+Goals — a list of planning targets to evaluate at a chosen month. Each
+goal carries `name` (label), `target` (the dollar threshold to hit),
+`by_month` (0-based month index, must be ≤ horizon), and `kind` (`cash`,
+default, or `net_worth` = cash + assets_value). Loading fails with the
+file name in the error if a name is empty, target is non-positive,
+`by_month` exceeds the horizon, or two goals share both name and
+`by_month`. The run output reports one line per goal in `by_month`
+order: `goal <name> met (<value> at month <N>)` or
+`goal <name> missed (<value> at month <N>, target <target>)`. Use
+`goals:` for any non-trivial planning question; reserve `saving:` for
+the simple "do I ever run out?" floor.
 
 Assets — note the required double nesting (variant name inside field name):
 
@@ -82,6 +100,15 @@ tax:
   children: 2
   parents:
     - { age_band: 60+, living_with: true }         # or 55-59
+```
+
+Goals — one or more planning targets. Worked example (college funding +
+retirement corpus):
+
+```yaml
+goals:
+  - { name: college, target: 200000, by_month: 240, kind: cash }
+  - { name: retirement, target: 1500000, by_month: 360, kind: net_worth }
 ```
 
 ## Simulation semantics (know these before interpreting)

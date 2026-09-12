@@ -24,19 +24,19 @@ The CLI SHALL accept an optional scenario file path as a positional argument (de
 - **THEN** it prints an error naming the unknown flag to stderr and exits with code 1, loading nothing
 
 ### Requirement: `--json` emits the per-month stats series
-When `--json` is passed, the CLI SHALL write exactly one JSON document to stdout: a compact array with one object per simulated month, in simulation order, each carrying `month` (0-based index of the month), `cash`, `assets_value`, and `monthly_cashflow` as numbers. The document SHALL be the only stdout output in this mode, and SHALL be parseable by a standard JSON parser. Without `--json`: when stdout is a terminal, the interactive TUI SHALL be shown instead (capability `tui-display`); when stdout is not a terminal, the human-readable summary (and insolvency line, when applicable) SHALL be printed byte-for-byte as before this change.
+When `--json` is passed, the CLI SHALL write exactly one JSON document to stdout: a wrapper object with two fields, `months` and `goals`. `months` is a compact array with one object per simulated month, in simulation order, each carrying `month` (0-based index of the month), `cash`, `assets_value`, and `monthly_cashflow` as numbers. `goals` is an array of per-goal outcomes (see capability `goal-tracking`); it is always present and `[]` when the scenario declares no goals. The document SHALL be the only stdout output in this mode, and SHALL be parseable by a standard JSON parser. Without `--json`: when stdout is a terminal, the interactive TUI SHALL be shown instead (capability `tui-display`); when stdout is not a terminal, the human-readable summary (and insolvency line, when applicable) SHALL be printed byte-for-byte as before this change.
 
 #### Scenario: Series shape and indexing
 - **WHEN** a scenario is run for 12 months with `--json`
-- **THEN** stdout parses as a JSON array of 13 objects whose `month` fields are 0 through 12 in order, each carrying numeric `cash`, `assets_value`, and `monthly_cashflow`
+- **THEN** stdout parses as a JSON object whose `months` field is an array of 13 objects whose `month` fields are 0 through 12 in order, each carrying numeric `cash`, `assets_value`, and `monthly_cashflow`; the `goals` field is also present (an array, length 0 when no goals declared)
 
 #### Scenario: JSON matches the text result
 - **WHEN** the same scenario is run with `--json` and without `--json` into a pipe
-- **THEN** the last array element's `cash`, `assets_value`, and `monthly_cashflow` equal the values in the human summary line
+- **THEN** the last element of `months` has `cash`, `assets_value`, and `monthly_cashflow` equal to the values in the human summary line
 
 #### Scenario: Insolvency is derivable, not duplicated
 - **WHEN** a scenario goes insolvent and is run with `--json`
-- **THEN** the array's first element with `cash` below zero is the same month the text mode reports as insolvent, and the JSON contains no separate insolvency field
+- **THEN** the `months` array's first element with `cash` below zero is the same month the text mode reports as insolvent, and the JSON contains no separate insolvency field
 
 #### Scenario: Text mode unchanged
 - **WHEN** a scenario is run without `--json` and stdout is not a terminal (pipe or redirect)

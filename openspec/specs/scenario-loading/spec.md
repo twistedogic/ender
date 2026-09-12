@@ -123,6 +123,17 @@ A `one_off_expense` or `one_off_income` event SHALL add a cashflow item that con
 - **WHEN** a `one_off_expense` event specifies an `id` and an `end` event with that id fires before the one-off's month
 - **THEN** the one-off is removed and contributes nothing in its month
 
+### Requirement: Scenario declares a goals list
+The scenario file SHALL accept an optional top-level `goals:` field alongside `cash`, `events`, and `saving`. The field SHALL be a list of goals; absent or empty SHALL be equivalent to no goals declared and SHALL NOT change the run's text or TUI rendering relative to a scenario without the field. Each goal SHALL carry four fields: `name` (a non-empty string), `target` (a positive number), `by_month` (a 0-based month index, SHALL be ≤ the scenario's horizon — otherwise loading fails with an error naming the file), and `kind` (`cash` or `net_worth`; default `cash`). Two goals SHALL NOT share both `name` and `by_month` (duplicate goal identity); duplicates SHALL fail to load with an error naming the file. Goals are evaluated post-run by capability `goal-tracking`.
+
+#### Scenario: Goals list parses
+- **WHEN** a scenario declares two goals with `kind: cash` and `kind: net_worth`
+- **THEN** loading succeeds and the scenario carries two goals with the stated names, targets, by_months, and kinds
+
+#### Scenario: Goal past horizon fails to load
+- **WHEN** a goal's `by_month` exceeds the scenario's horizon
+- **THEN** loading fails with an error naming the file and identifying the offending goal
+
 ### Requirement: Scenario may declare a cash reserve
 The scenario file SHALL accept an optional top-level `reserve_months` field: a non-negative integer number of months of recurring expenses to hold as cash. When the field is absent or `0`, no reserve requirement SHALL apply and behavior SHALL be identical to a scenario without the field. A `reserve_months` value that is not a non-negative integer SHALL fail loading with the existing file error reporting.
 
