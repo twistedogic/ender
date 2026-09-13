@@ -14,13 +14,13 @@ of `reserve_months` when set to a positive value.
 
 #### Scenario: Cash-zero with no reserve triggers fund drawdown
 
-- **WHEN** a scenario declares `cash: 50`, `reserve_months: 0`, a rent
+- **WHEN** a scenario declares `cash: 200`, `reserve_months: 0`, a rent
   expense of `200/mo`, and a fund asset with `principal: 1000` and
   `annualized_rate: 0.0`
-- **THEN** after one simulated month, the scenario's `cash ≥ 0.0` and
-  the fund's `principal` is reduced by the amount needed to cover the
-  post-rent shortfall (was `−1150` with the fund untouched; now drawn
-  from the fund up to its full 1000 principal).
+- **THEN** after one simulated month, the scenario's `cash = 0.0` and
+  the fund is fully drained (`principal = 0`, asset list empty).
+  Without this behavior, the same scenario would leave `cash = -1000`
+  with the fund untouched.
 
 #### Scenario: Positive cash with no reserve does not trigger settlement
 
@@ -32,8 +32,9 @@ of `reserve_months` when set to a positive value.
 
 #### Scenario: Cash-zero with positive reserve restores to buffer target
 
-- **WHEN** a scenario declares `cash: 100`, `reserve_months: 3`, a rent
-  expense of `200/mo`, and a fund asset with `principal: 1000`
-- **THEN** after one simulated month, the simulator reports `cash` at
-  or above `3 × 200 = 600` (the buffer target), with the fund drawn to
-  cover the shortfall up to that target.
+- **WHEN** a scenario declares `cash: 800`, `reserve_months: 3`, a rent
+  expense of `200/mo`, and a fund asset with `principal: 1000` and
+  `annualized_rate: 0.0`
+- **THEN** after one simulated month, the scenario's `cash = 600`
+  (the buffer target `3 × 200`), with the fund fully drained to cover
+  the shortfall up to that target.

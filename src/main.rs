@@ -759,10 +759,9 @@ impl Scenario {
 
     /// Restore the cash reserve by drawing funds, then selling properties.
     /// Liquidation is a balance-sheet move: proceeds never appear in monthly_cashflow.
+    /// Fires whenever cash drops below `reserve_months * expense_base`; with
+    /// `reserve_months = 0` the target is zero and the floor is `cash >= 0`.
     fn settle(&mut self, expense_base: f64) {
-        if self.reserve_months == 0 {
-            return;
-        }
         let target = self.reserve_months as f64 * expense_base;
         if self.cash >= target {
             return;
@@ -1246,7 +1245,7 @@ events:
     fn mortgage_period_allows_u16_range() {
         // 300 = 25-year loan; u8 saturated this to 255 (see scenarios/NOTES.md)
         let yaml = "
-cash: 0
+cash: 100
 events:
   - when: 0
     type: buy_home
@@ -1256,7 +1255,7 @@ events:
             .unwrap()
             .into_scenario().unwrap();
         let stats = s.run(1);
-        assert_eq!(stats[0].cash, -100.0);
+        assert_eq!(stats[0].cash, 0.0);
     }
 
     #[test]
@@ -1425,7 +1424,7 @@ events:
     #[test]
     fn end_stops_fund_contribution() {
         let yaml = "
-cash: 0
+cash: 2000
 events:
   - when: 0
     type: investment
@@ -1531,7 +1530,7 @@ events:
     #[test]
     fn full_vocabulary_loads_and_fires() {
         let yaml = r#"
-cash: 5000
+cash: 600000
 events:
   - when: 0
     type: job
@@ -1637,10 +1636,13 @@ events:
     }
 
     #[test]
-    fn absent_reserve_disables_settlement() {
-        // No reserve_months: cash goes negative, fund sits untouched.
+    fn cash_zero_triggers_settlement_without_reserve() {
+        // cash 200, reserve_months 0, fund 1000, rent 200.
+        // Event: investment deducts 1000 -> cash -800. Rent -200 -> cash -1000.
+        // With reserve_months 0 the cash-zero floor fires settle; fund drawn
+        // 1000 brings cash back to 0.
         let yaml = "
-cash: 50
+cash: 200
 events:
   - when: 0
     type: expense
@@ -1653,11 +1655,51 @@ events:
             .unwrap()
             .into_scenario().unwrap();
         let stats = s.run(0);
-        assert_eq!(stats[0].cash, -1150.0); // 50 - 1000 fund - 200 rent; no settlement
-        match &s.assets[0] {
-            Asset::Fund { principal, .. } => assert_eq!(*principal, 1000.0), // untouched
-            _ => panic!("expected fund"),
-        }
+        assert_eq!(stats[0].cash, 0.0);
+        assert!(s.assets.is_empty());
+    }
+
+    #[test]
+    fn positive_cash_with_no_reserve_does_not_settle() {
+        // cash 50000, reserve_months 0, rent 2000 -> cash 48000, no settle.
+        let yaml = "
+cash: 50000
+events:
+  - when: 0
+    type: expense
+    rent: { monthly: 2000, annualized_rate: 0.0 }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario().unwrap();
+        let stats = s.run(0);
+        assert_eq!(stats[0].cash, 48000.0);
+        assert!(s.assets.is_empty());
+    }
+
+    #[test]
+    fn cash_zero_with_reserve_restores_to_buffer() {
+        // cash 800, reserve_months 3, fund 1000, rent 200.
+        // Event: fund deducts 1000 -> cash -200. Rent -200 -> cash -400.
+        // Settle: target 3*200=600, shortfall 1000, draw 1000 from fund ->
+        // cash 600, fund principal 0.
+        let yaml = "
+cash: 800
+reserve_months: 3
+events:
+  - when: 0
+    type: expense
+    rent: { monthly: 200, annualized_rate: 0.0 }
+  - when: 0
+    type: investment
+    fund: { principal: 1000, annualized_rate: 0.0 }
+";
+        let mut s = serde_yaml_ng::from_str::<ScenarioInput>(yaml)
+            .unwrap()
+            .into_scenario().unwrap();
+        let stats = s.run(0);
+        assert_eq!(stats[0].cash, 600.0);
+        assert!(s.assets.is_empty());
     }
 
     #[test]
@@ -2667,7 +2709,7 @@ events:
     #[test]
     fn downturn_drops_fund_and_property_in_one_month() {
         let mut s = scenario(
-            "cash: 0
+            "cash: 4000000
 events:
   - when: 0
     type: investment
@@ -2696,7 +2738,7 @@ events:
     #[test]
     fn downturn_only_equity_leaves_property_untouched() {
         let mut s = scenario(
-            "cash: 0
+            "cash: 3001000
 events:
   - when: 0
     type: investment
@@ -2725,7 +2767,7 @@ events:
         // One downturn at month 0 with drop 0.5; running the loaded
         // scenario for 5 months must not re-apply the drop on later months.
         let mut s = scenario(
-            "cash: 0
+            "cash: 1000
 events:
   - when: 0
     type: investment
@@ -2749,7 +2791,7 @@ events:
     #[test]
     fn refinance_updates_mortgage_monthly() {
         let mut s = scenario(
-            "cash: 0
+            "cash: 15000
 events:
   - when: 0
     type: buy_home
@@ -2775,7 +2817,7 @@ events:
     #[test]
     fn refinance_unknown_id_is_noop() {
         let mut s = scenario(
-            "cash: 0
+            "cash: 11000
 events:
   - when: 0
     type: buy_home
