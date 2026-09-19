@@ -12,34 +12,59 @@ results. The model is Hong Kong-specific (MPF, IRD salaries/property tax).
 ## Running
 
 ```sh
-cargo run --quiet -- scenarios/foo.yaml          # text summary (non-TTY)
-cargo run --quiet -- --json scenarios/foo.yaml   # full monthly series as JSON
-cargo run --quiet -- compare scenarios/a.yaml scenarios/b.yaml      # side-by-side key stats
-cargo run --quiet -- compare --json scenarios/a.yaml scenarios/b.yaml  # JSON array, one element per scenario
+ender scenarios/foo.yaml                       # text summary (non-TTY) or TUI (TTY)
+ender --json scenarios/foo.yaml                # full monthly series as JSON
+ender compare scenarios/a.yaml scenarios/b.yaml            # side-by-side key stats (text or TUI)
+ender compare --json scenarios/a.yaml scenarios/b.yaml    # JSON array, one element per scenario
 ```
 
-- No `--help`. Only flags: `--json` (anywhere). First non-flag arg is the path
-  (default `scenario.yaml`), unless it is the literal `compare`, in which case
-  the remaining positional args are scenario paths and `compare` runs them all
-  and emits a side-by-side key-stats table (TTY: ratatui; non-TTY: aligned
-  text; `--json`: a JSON array whose elements mirror the per-scenario wrapper
-  with an added `name` field). A scenario file literally named `compare`
-  (no extension) would be misinterpreted as the subcommand — name scenarios
-  descriptively.
-- Non-TTY stdout prints a 3-line summary: final month (cash, assets,
-  monthly cashflow), `insolvent from month N` (first month cash < 0),
-  `saving target breached at month N` if a `saving:` target was set, and
-  one `goal <name> met|missed (...)` line per declared goal (in `by_month`
-  order).
-- JSON is a wrapper object: `terminal` is `true` when a `death` event
-  cut the run short, `terminal_month` is the integer month it stopped at
-  (only present when `terminal` is `true`), `months` is the per-month array
-  of `{month, cash, assets_value, monthly_cashflow}` objects, `goals` is
-  the array of `{name, target, by_month, kind: "cash"|"net_worth", met,
-  value}` outcomes. `goals` is always present, `[]` when no goals declared.
-  Use it when you need intermediate values (e.g. cash at a specific age).
-- Deterministic — there is no Monte Carlo. Model risk explicitly with
-  `downturn` events instead.
+- **CLI**: no `--help`. The only flag is `--json` (anywhere). First non-flag
+  arg picks the mode: `compare` → side-by-side, anything else → a single
+  scenario path (default `scenario.yaml`). Any other `-`-prefixed arg is an
+  error. A file literally named `compare` (no extension) is parsed as the
+  subcommand — name scenarios descriptively.
+
+- **Single, non-TTY** — text summary, one line per concern:
+  ```
+  after N months: cash X.XX, assets Y.YY, monthly cashflow Z.ZZ
+  [insolvent from month N]                              # only when cash < 0
+  [saving target breached at month N]                   # only when `saving:` is set
+  [goal <name> met (X.XX at month N)]                   # one per declared goal, by_month order
+  [goal <name> missed (X.XX at month N, target T.TT)]
+  [terminal at month N (death event)]                   # only when a death event fired
+  ```
+
+- **Single, TTY** — interactive ratatui TUI. Header shows the same key
+  statistics as the text summary (final / min / insolvent / goals /
+  terminal) above a scrollable per-month table
+  (`month` / `cash` / `assets_value` / `monthly_cashflow`). `j`/`k`/arrows
+  step one row, `PageUp`/`PageDown` step a screen, `q`/`Esc` quit.
+
+- **Single, JSON** — wrapper object: `terminal` (bool), `terminal_month`
+  (integer, only present when `terminal` is true), `months` (array of
+  `{month, cash, assets_value, monthly_cashflow}` per simulated month),
+  `goals` (array of `{name, target, by_month, kind: "cash"|"net_worth",
+  met, value}`). `goals` is always present (`[]` when none declared). Use
+  this when you need intermediate values (e.g. cash at a specific age, or
+  how a goal's path played out month by month).
+
+- **Compare, non-TTY** — aligned text table. Fixed columns: `scenario`,
+  `final cash`, `final assets`, `final cashflow`, `min cash`,
+  `min cash month`, `first insolvent month` (`never` / `month N`),
+  `terminal month` (`—` / `month N`). When any row carries goals, one
+  extra column per distinct goal name (first-occurrence order) is appended
+  with cells `met` or `missed (X.XX)`.
+
+- **Compare, TTY** — ratatui table with the same columns; static snapshot
+  (no scroll, no input loop).
+
+- **Compare, JSON** — array, one element per scenario in input order.
+  Each element: `name` (basename), `terminal`, optional `terminal_month`,
+  `key_stats` (`{final_cash, final_assets_value, final_monthly_cashflow,
+  min_cash, min_cash_month, first_insolvent_month}`), `goals` (same shape
+  as single mode). No per-month series — use single mode for that.
+
+- Deterministic — no Monte Carlo. Model risk explicitly with `downturn`.
 
 ## Scenario schema
 
@@ -160,7 +185,6 @@ reserve answer "does the portfolio survive?" without hand-authoring
 hundreds of one-off expenses:
 
 ```yaml
-# scenarios/retire-withdrawal.yaml
 cash: 200000
 reserve_months: 12
 events:
@@ -194,8 +218,7 @@ lands on the same month as the death.
 **Life insurance** — a recurring premium expense from `when: 0`, a
 `one_off_income` of the policy's payout at the assumed death month,
 and a `death` event at the same month. The terminal cash after the
-payout is the estate's liquid value at death. Example
-(`scenarios/insurance-life.yaml`):
+payout is the estate's liquid value at death. Example:
 
 ```yaml
 start: 2026-01
@@ -213,11 +236,9 @@ adds `terminal: true, terminal_month: 720` to the wrapper.
 **Income protection / disability** — a recurring premium expense, the
 main job ending via `end: {id: main-job}` at the disability month, and
 a replacement income stream from that month onward. No `death` event:
-the run continues at a lower income level until the horizon. Use
-`rental_income` attached to a zero-priced `buy_to_let` as the
-replacement stream — ender has no dedicated pension primitive yet
-(`add-pension-cashflow` will add one). Example
-(`scenarios/insurance-disability.yaml`):
+the run continues at a lower income level until the horizon. Use a
+`pension` cashflow as the replacement stream (no MPF, gross flows into
+salaries-tax accrual). Example:
 
 ```yaml
 cash: 500000
