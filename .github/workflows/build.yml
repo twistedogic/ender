@@ -37,6 +37,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu,armv7-unknown-linux-gnueabihf,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cross linkers (Linux ARM)
@@ -51,16 +53,19 @@ jobs:
       # ponytail: tarball with bare `ender` at root, named for mise github: backend
       # upgrade if mise ever wants dir-prefixed archives (ender-<v>/ender)
       - name: Package
+        id: package
         run: |
           mkdir -p dist
-          VERSION=$([[ "$GITHUB_REF_NAME" == v* ]] && echo "${GITHUB_REF_NAME#v}" || echo "dev")
+          VERSION=${GITHUB_REF_NAME#v}
+          if [[ "$GITHUB_REF_NAME" != v* ]]; then VERSION=dev; fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           tar -C target/${{ matrix.target }}/release -czf dist/ender-${VERSION}-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz ender
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ender-${{ matrix.target }}
-          path: dist/ender-${VERSION}-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
+          path: dist/ender-${{ steps.package.outputs.version }}-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
 
   release:
     needs: build
