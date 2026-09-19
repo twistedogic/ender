@@ -1,6 +1,10 @@
 ---
 name: ender
-description: Run financial scenario simulations with the `ender` binary (Hong Kong cashflow model: salaries, MPF, IRD tax, funds, mortgages, buy-to-let). Use when the user wants retirement planning, affordability checks, or "what if" money scenarios.
+description: 'Run financial scenario simulations with the `ender` binary (Hong Kong cashflow model: salaries, MPF, IRD tax, funds, mortgages, buy-to-let). Use when the user wants retirement planning, affordability checks, or "what if" money scenarios.'
+compatibility: 'Requires the `ender` CLI on PATH, a POSIX shell, and optional network access for rate lookups (e.g. via lightpanda).'
+metadata:
+  author: ender contributors
+  version: 0.1.0
 ---
 
 # ender — financial scenario simulation
